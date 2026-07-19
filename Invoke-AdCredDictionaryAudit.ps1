@@ -44,7 +44,8 @@ param(
     [switch]$IncludeDisabledAccounts,
     [int]$ExpectedCount = -1,
     [string]$FixturePath,                  # dev: load AccountSecret records from JSON instead of extracting
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$EseProbe                      # B1 lab probe: open -DatabasePath read-only and print datatable row count
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,6 +95,178 @@ namespace AdCredAudit
     Add-Type -TypeDefinition $ntHashSource -Language CSharp
 }
 #endregion Interop
+
+#region ESE Interop — B1: open an offline ntds.dit read-only and iterate the datatable (esent.dll, in-box).
+#
+#  LAB-VALIDATION CHECKLIST (this block cannot be exercised off-Windows; it only *compiles* here):
+#   1. Entry points use ANSI base exports (JetSetSystemParameter, JetCreateInstance, JetBeginSession,
+#      JetAttachDatabase, JetOpenDatabase, JetOpenTable). If EntryPointNotFoundException -> switch to the
+#      W-suffixed exports + CharSet.Unicode.
+#   2. Page size is pinned to 8192 (ntds.dit default). If JET_errPageSizeMismatch (-1213) -> adjust.
+#   3. Opens recovery-Off / read-only, expecting a CLEAN shutdown. If JET_errDatabaseDirtyShutdown (-550)
+#      -> operator runs `esentutl /r <logbase>` (or supply a clean IFM copy) before auditing.
+#   4. System/Temp/Log paths are pointed at %TEMP% so nothing is written into a read-only snapshot dir.
+#   5. Handles sized as IntPtr (JET_INSTANCE/SESID/TABLEID) and JET_DBID as uint; validated for 64-bit.
+#   6. JetOpenTable grbit = 0 (read intent inherited from the read-only DB); add JET_bitTableReadOnly(0x4) if needed.
+#
+if (-not ('AdCredAudit.EseReader' -as [type])) {
+    $eseSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace AdCredAudit
+{
+    public sealed class EseException : Exception
+    {
+        public int Code;
+        public EseException(int code, string context)
+            : base(string.Format("ESENT error {0} [{1}] during {2}.", code, EseReader.ErrName(code), context))
+        { this.Code = code; }
+    }
+
+    // B1 scope: open + count datatable rows. MoveFirst/MoveNext are public for the B2+ column-retrieval work.
+    public sealed class EseReader : IDisposable
+    {
+        private IntPtr _instance = IntPtr.Zero;   // JET_INSTANCE  (pointer-sized)
+        private IntPtr _sesid    = IntPtr.Zero;   // JET_SESID     (pointer-sized)
+        private uint   _dbid     = 0;             // JET_DBID      (32-bit)
+        private IntPtr _table    = IntPtr.Zero;   // JET_TABLEID   (pointer-sized)
+        private bool _instInited, _sessionOpen, _tableOpen;
+
+        private const uint JET_bitDbReadOnly            = 0x1;
+        private const int  JET_MoveFirst                = unchecked((int)0x80000000);
+        private const int  JET_MoveNext                 = 1;
+        private const uint JET_paramSystemPath          = 0;
+        private const uint JET_paramTempPath            = 1;
+        private const uint JET_paramLogFilePath         = 2;
+        private const uint JET_paramMaxTemporaryTables  = 60;
+        private const uint JET_paramRecovery            = 34;
+        private const uint JET_paramDatabasePageSize    = 64;
+        private const int  err_Success                  = 0;
+        private const int  err_NoCurrentRecord          = -1603;
+        private const int  err_DatabaseDirtyShutdown    = -550;
+        private const int  err_PageSizeMismatch         = -1213;
+        private const int  NtdsPageSize                 = 8192;
+
+        // Global param (pinstance = NULL): must be set before the instance exists.
+        [DllImport("esent.dll", CharSet = CharSet.Ansi, EntryPoint = "JetSetSystemParameter")]
+        private static extern int JetSetSystemParameterGlobal(IntPtr pinstance, IntPtr sesid, uint paramid, IntPtr lParam, string szParam);
+        // Per-instance param (pinstance = &instance): set after create, before init.
+        [DllImport("esent.dll", CharSet = CharSet.Ansi, EntryPoint = "JetSetSystemParameter")]
+        private static extern int JetSetSystemParameterInst(ref IntPtr pinstance, IntPtr sesid, uint paramid, IntPtr lParam, string szParam);
+        [DllImport("esent.dll", CharSet = CharSet.Ansi)]
+        private static extern int JetCreateInstance(out IntPtr instance, string szInstanceName);
+        [DllImport("esent.dll")]
+        private static extern int JetInit(ref IntPtr instance);
+        [DllImport("esent.dll", CharSet = CharSet.Ansi)]
+        private static extern int JetBeginSession(IntPtr instance, out IntPtr sesid, string szUserName, string szPassword);
+        [DllImport("esent.dll", CharSet = CharSet.Ansi)]
+        private static extern int JetAttachDatabase(IntPtr sesid, string szFilename, uint grbit);
+        [DllImport("esent.dll", CharSet = CharSet.Ansi)]
+        private static extern int JetOpenDatabase(IntPtr sesid, string szFilename, string szConnect, out uint dbid, uint grbit);
+        [DllImport("esent.dll", CharSet = CharSet.Ansi)]
+        private static extern int JetOpenTable(IntPtr sesid, uint dbid, string szTableName, IntPtr pvParameters, uint cbParameters, uint grbit, out IntPtr tableid);
+        [DllImport("esent.dll")]
+        private static extern int JetMove(IntPtr sesid, IntPtr tableid, int cRow, uint grbit);
+        [DllImport("esent.dll")]
+        private static extern int JetCloseTable(IntPtr sesid, IntPtr tableid);
+        [DllImport("esent.dll")]
+        private static extern int JetEndSession(IntPtr sesid, uint grbit);
+        [DllImport("esent.dll")]
+        private static extern int JetTerm(IntPtr instance);
+
+        public static string ErrName(int code)
+        {
+            switch (code)
+            {
+                case err_NoCurrentRecord:       return "JET_errNoCurrentRecord";
+                case err_DatabaseDirtyShutdown: return "JET_errDatabaseDirtyShutdown - recover with 'esentutl /r' or supply a clean copy";
+                case err_PageSizeMismatch:      return "JET_errPageSizeMismatch - DB page size != 8192";
+                default:                        return "JET_err";
+            }
+        }
+
+        private static void Check(int err, string context)
+        {
+            if (err != err_Success) throw new EseException(err, context);
+        }
+
+        public EseReader(string dbPath)
+        {
+            string tempDir = System.IO.Path.GetTempPath();
+
+            // Global (before instance creation):
+            Check(JetSetSystemParameterGlobal(IntPtr.Zero, IntPtr.Zero, JET_paramDatabasePageSize, (IntPtr)NtdsPageSize, null), "set page size");
+
+            Check(JetCreateInstance(out _instance, "adcredaudit"), "create instance");
+
+            // Per-instance (after create, before init):
+            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramRecovery, IntPtr.Zero, "Off"), "disable recovery");
+            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramMaxTemporaryTables, IntPtr.Zero, null), "no temp tables");
+            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramSystemPath, IntPtr.Zero, tempDir), "system path");
+            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramTempPath, IntPtr.Zero, tempDir), "temp path");
+            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramLogFilePath, IntPtr.Zero, tempDir), "log path");
+
+            Check(JetInit(ref _instance), "init"); _instInited = true;
+            Check(JetBeginSession(_instance, out _sesid, null, null), "begin session"); _sessionOpen = true;
+            Check(JetAttachDatabase(_sesid, dbPath, JET_bitDbReadOnly), "attach database");
+            Check(JetOpenDatabase(_sesid, dbPath, null, out _dbid, JET_bitDbReadOnly), "open database");
+        }
+
+        private void OpenDatatable()
+        {
+            if (_tableOpen) return;
+            Check(JetOpenTable(_sesid, _dbid, "datatable", IntPtr.Zero, 0, 0, out _table), "open datatable");
+            _tableOpen = true;
+        }
+
+        public bool MoveFirst()
+        {
+            OpenDatatable();
+            int err = JetMove(_sesid, _table, JET_MoveFirst, 0);
+            if (err == err_NoCurrentRecord) return false;
+            Check(err, "move first");
+            return true;
+        }
+
+        public bool MoveNext()
+        {
+            int err = JetMove(_sesid, _table, JET_MoveNext, 0);
+            if (err == err_NoCurrentRecord) return false;
+            Check(err, "move next");
+            return true;
+        }
+
+        // B1 deliverable: open the datatable and count every row.
+        public long CountDatatableRows()
+        {
+            long count = 0;
+            if (MoveFirst()) { do { count++; } while (MoveNext()); }
+            return count;
+        }
+
+        public void Dispose()
+        {
+            try { if (_tableOpen)   { JetCloseTable(_sesid, _table); _tableOpen = false; } } catch { }
+            try { if (_sessionOpen) { JetEndSession(_sesid, 0);      _sessionOpen = false; } } catch { }
+            try { if (_instInited)  { JetTerm(_instance);            _instInited = false; } } catch { }
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $eseSource -Language CSharp
+}
+
+function Measure-NtdsDatatableRow {
+    # B1 lab probe: open an offline ntds.dit read-only and count datatable rows.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$DatabasePath)
+    $resolved = (Resolve-Path -LiteralPath $DatabasePath).Path
+    $reader = [AdCredAudit.EseReader]::new($resolved)
+    try { $reader.CountDatatableRows() }
+    finally { $reader.Dispose() }
+}
+#endregion ESE Interop
 
 #region Extract — the pluggable seam. Contract: AccountSecret = { SamAccountName, Rid, NtHashHex, Enabled }.
 function Get-AccountSecret {
@@ -310,6 +483,13 @@ function Invoke-SelfTest {
 if ($MyInvocation.InvocationName -ne '.') {
 
     if ($SelfTest) { Invoke-SelfTest; return }
+
+    if ($EseProbe) {
+        if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-EseProbe requires -DatabasePath (an offline ntds.dit copy).' }
+        $rows = Measure-NtdsDatatableRow -DatabasePath $DatabasePath
+        Write-Host ("datatable rows: {0}" -f $rows)
+        return
+    }
 
     if ([string]::IsNullOrWhiteSpace($Canary)) { throw 'A -Canary account name is required for a trustworthy run (fail-closed).' }
 
