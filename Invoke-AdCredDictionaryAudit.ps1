@@ -50,7 +50,8 @@ param(
     [int]$First = 20,
     [string]$SystemHivePath,               # offline SYSTEM hive copy (boot key source)
     [switch]$BootKeyProbe,                  # B3 lab probe: derive + print the boot key from -SystemHivePath
-    [switch]$PekProbe                       # B4 lab probe: decrypt + summarize the PEK list
+    [switch]$PekProbe,                      # B4 lab probe: decrypt + summarize the PEK list
+    [switch]$HashProbe                      # B5 lab probe: decrypt + print per-account NT hashes
 )
 
 $ErrorActionPreference = 'Stop'
@@ -138,6 +139,7 @@ namespace AdCredAudit
         public string Sid;
         public bool HasNtHash;
         public bool Enabled;
+        public byte[] NtHashBlob;   // raw encrypted unicodePwd blob (decrypted in PS via Secret.DecryptNtHash)
     }
 
     // B1 scope: open + count datatable rows. MoveFirst/MoveNext are public for the B2+ column-retrieval work.
@@ -148,6 +150,7 @@ namespace AdCredAudit
         private uint   _dbid     = 0;             // JET_DBID      (32-bit)
         private IntPtr _table    = IntPtr.Zero;   // JET_TABLEID   (pointer-sized)
         private bool _instInited, _sessionOpen, _tableOpen;
+        private static int _instanceSeq;
 
         private const uint JET_bitDbReadOnly            = 0x1;
         private const int  JET_MoveFirst                = unchecked((int)0x80000000);
@@ -242,7 +245,8 @@ namespace AdCredAudit
             // Global (before instance creation):
             Check(JetSetSystemParameterGlobal(IntPtr.Zero, IntPtr.Zero, JET_paramDatabasePageSize, (IntPtr)NtdsPageSize, null), "set page size");
 
-            Check(JetCreateInstance(out _instance, "adcredaudit"), "create instance");
+            string instName = "adcredaudit_" + System.Threading.Interlocked.Increment(ref _instanceSeq);
+            Check(JetCreateInstance(out _instance, instName), "create instance");
 
             // Per-instance (after create, before init):
             Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramRecovery, IntPtr.Zero, "Off"), "disable recovery");
@@ -356,7 +360,8 @@ namespace AdCredAudit
                 row.Sid = FormatSid(sid);
             }
 
-            row.HasNtHash = _hasNtHash && Retrieve(_colNtHash) != null;
+            row.NtHashBlob = _hasNtHash ? Retrieve(_colNtHash) : null;
+            row.HasNtHash = row.NtHashBlob != null;
             return row;
         }
 
@@ -709,6 +714,56 @@ namespace AdCredAudit
             for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
             return true;
         }
+
+        // ---- B5: per-account NT hash (layer 1 = PEK decrypt, layer 2 = DES-by-RID) ----
+
+        [DllImport("advapi32.dll", EntryPoint = "SystemFunction027", SetLastError = true, CallingConvention = CallingConvention.StdCall)]
+        private static extern int SystemFunction027([In] byte[] encrypted, [In] ref int index, [In, Out] byte[] output);
+
+        // Layer 1: strip the PEK layer. AlgId(2)|Flags(2)|PekId(4)|Salt(16)|[AES only: SecretLen(4)]|EncData
+        public static byte[] DecryptSecret(byte[] blob, PekList pek)
+        {
+            int algId = BitConverter.ToUInt16(blob, 0);
+            int pekId = BitConverter.ToInt32(blob, 4);
+            byte[] salt = new byte[16]; Array.Copy(blob, 8, salt, 0, 16);
+            byte[] key = pek.Key(pekId);
+            if (key == null) throw new Exception("PEK index " + pekId + " not present in the PEK list.");
+
+            if (algId == 0x11) // DatabaseRC4WithSalt (1 salt-hash round)
+            {
+                byte[] enc = new byte[blob.Length - 24]; Array.Copy(blob, 24, enc, 0, enc.Length);
+                return DecryptRc4WithSalt(enc, salt, key, 1);
+            }
+            if (algId == 0x13) // DatabaseAES
+            {
+                int secretLen = BitConverter.ToInt32(blob, 24);
+                byte[] enc = new byte[blob.Length - 28]; Array.Copy(blob, 28, enc, 0, enc.Length);
+                byte[] dec = DecryptAesCbc(enc, salt, key);
+                if (secretLen >= 0 && secretLen < dec.Length)
+                {
+                    byte[] trimmed = new byte[secretLen]; Array.Copy(dec, 0, trimmed, 0, secretLen); return trimmed;
+                }
+                return dec;
+            }
+            throw new Exception("Unsupported secret encryption type: 0x" + algId.ToString("X"));
+        }
+
+        // Layer 2: remove the RID DES layer (in-box advapi32).
+        public static byte[] DecryptDesByRid(byte[] encrypted16, int rid)
+        {
+            byte[] output = new byte[16];
+            int st = SystemFunction027(encrypted16, ref rid, output);
+            if (st != 0) throw new Exception(string.Format("SystemFunction027 (DES-by-RID) failed: 0x{0:X8}", st));
+            return output;
+        }
+
+        // Full per-account NT hash: PEK layer then RID-DES layer.
+        public static byte[] DecryptNtHash(byte[] unicodePwdBlob, int rid, PekList pek)
+        {
+            byte[] layer1 = DecryptSecret(unicodePwdBlob, pek);
+            if (layer1.Length != 16) throw new Exception("Unexpected NT hash length after PEK decrypt: " + layer1.Length);
+            return DecryptDesByRid(layer1, rid);
+        }
     }
 }
 '@
@@ -739,6 +794,40 @@ function Get-NtdsPekList {
     try { $blob = $reader.FindPekListBlob() } finally { $reader.Dispose() }
     if (-not $blob) { throw 'No pekList blob found in the datatable.' }
     [AdCredAudit.Secret]::DecryptPekList($blob, $bootKeyBytes)
+}
+
+function Get-NtdsAccountHash {
+    # B5: decrypt each account's NT hash (PEK layer + DES-by-RID). One ESE open for PEK + accounts.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DatabasePath,
+        [string]$SystemHivePath,
+        [string]$BootKey,
+        [int]$First = 0,                       # 0 = all accounts
+        [switch]$IncludeDisabledAccounts
+    )
+    $bootKeyBytes = Resolve-AuditBootKey -BootKey $BootKey -SystemHivePath $SystemHivePath
+    $reader = [AdCredAudit.EseReader]::new((Resolve-Path -LiteralPath $DatabasePath).Path)
+    try {
+        $blob = $reader.FindPekListBlob()
+        if (-not $blob) { throw 'No pekList blob found in the datatable.' }
+        $pek = [AdCredAudit.Secret]::DecryptPekList($blob, $bootKeyBytes)
+        if (-not $pek.SignatureValid) {
+            throw 'PEK signature invalid - boot key or decryption is wrong; refusing to emit hashes (fail-closed).'
+        }
+        foreach ($r in $reader.DumpAccountRows($First)) {
+            if (-not $r.NtHashBlob) { continue }
+            if (-not $IncludeDisabledAccounts -and -not $r.Enabled) { continue }
+            $nt = [AdCredAudit.Secret]::DecryptNtHash($r.NtHashBlob, [int]$r.Rid, $pek)
+            [PSCustomObject]@{
+                SamAccountName = $r.SamAccountName
+                Rid            = $r.Rid
+                Enabled        = $r.Enabled
+                NtHashHex      = (-join ($nt | ForEach-Object { $_.ToString('X2') }))
+            }
+        }
+    }
+    finally { $reader.Dispose() }
 }
 #endregion Secret Crypto
 
@@ -987,6 +1076,13 @@ if ($MyInvocation.InvocationName -ne '.') {
             KeyCount        = $pek.KeyCount
             CurrentKeyIndex = $pek.CurrentKeyIndex
         } | Format-List
+        return
+    }
+
+    if ($HashProbe) {
+        if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-HashProbe requires -DatabasePath (and -SystemHivePath or -BootKey).' }
+        Get-NtdsAccountHash -DatabasePath $DatabasePath -SystemHivePath $SystemHivePath -BootKey $BootKey `
+            -First $First -IncludeDisabledAccounts:$IncludeDisabledAccounts | Format-Table -AutoSize
         return
     }
 
