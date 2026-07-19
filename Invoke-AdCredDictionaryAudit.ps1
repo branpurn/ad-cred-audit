@@ -45,7 +45,9 @@ param(
     [int]$ExpectedCount = -1,
     [string]$FixturePath,                  # dev: load AccountSecret records from JSON instead of extracting
     [switch]$SelfTest,
-    [switch]$EseProbe                      # B1 lab probe: open -DatabasePath read-only and print datatable row count
+    [switch]$EseProbe,                     # B1 lab probe: open -DatabasePath read-only and print datatable row count
+    [switch]$EseDumpAccounts,              # B2 lab probe: dump the first -First account rows
+    [int]$First = 20
 )
 
 $ErrorActionPreference = 'Stop'
@@ -124,6 +126,17 @@ namespace AdCredAudit
         { this.Code = code; }
     }
 
+    public sealed class AccountRow
+    {
+        public string SamAccountName;
+        public int SamAccountType;
+        public int UserAccountControl;
+        public long Rid;
+        public string Sid;
+        public bool HasNtHash;
+        public bool Enabled;
+    }
+
     // B1 scope: open + count datatable rows. MoveFirst/MoveNext are public for the B2+ column-retrieval work.
     public sealed class EseReader : IDisposable
     {
@@ -147,6 +160,17 @@ namespace AdCredAudit
         private const int  err_DatabaseDirtyShutdown    = -550;
         private const int  err_PageSizeMismatch         = -1213;
         private const int  NtdsPageSize                 = 8192;
+        private const uint JET_ColInfo                  = 0;
+        private const int  err_ColumnNotFound           = -1004;
+        private const int  JET_wrnColumnNull            = 1004;
+        private const int  JET_wrnBufferTruncated       = 1006;
+        // Well-known ATTRTYP datatable column names (system attributes; IDs are fixed/stable).
+        private const string Col_SamAccountName     = "ATTm590045";
+        private const string Col_SamAccountType     = "ATTj590126";
+        private const string Col_UserAccountControl = "ATTj589832";
+        private const string Col_ObjectSid          = "ATTr589970";
+        private const string Col_UnicodePwd         = "ATTk589914";
+        private const string Col_PekList            = "ATTk590689";
 
         // Global param (pinstance = NULL): must be set before the instance exists.
         [DllImport("esent.dll", CharSet = CharSet.Ansi, EntryPoint = "JetSetSystemParameter")]
@@ -174,6 +198,23 @@ namespace AdCredAudit
         private static extern int JetEndSession(IntPtr sesid, uint grbit);
         [DllImport("esent.dll")]
         private static extern int JetTerm(IntPtr instance);
+        [DllImport("esent.dll", CharSet = CharSet.Ansi)]
+        private static extern int JetGetTableColumnInfo(IntPtr sesid, IntPtr tableid, string szColumnName, ref JET_COLUMNDEF pvResult, uint cbMax, uint InfoLevel);
+        [DllImport("esent.dll")]
+        private static extern int JetRetrieveColumn(IntPtr sesid, IntPtr tableid, uint columnid, byte[] pvData, uint cbData, out uint cbActual, uint grbit, IntPtr pretinfo);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JET_COLUMNDEF
+        {
+            public uint cbStruct; public uint columnid; public uint coltyp;
+            public ushort wCountry; public ushort langid; public ushort cp; public ushort wCollate;
+            public uint cbMax; public uint grbit;
+        }
+
+        // ---- B2 column state (resolved once, lazily) ----
+        private bool _columnsResolved;
+        private uint _colSam, _colSamType, _colUac, _colSid, _colNtHash;
+        private bool _hasSam, _hasSamType, _hasUac, _hasSid, _hasNtHash;
 
         public static string ErrName(int code)
         {
@@ -245,6 +286,120 @@ namespace AdCredAudit
             return count;
         }
 
+        // ---- B2: column resolution + retrieval + account-row reading ----
+
+        private bool TryGetColumn(string name, out uint columnid)
+        {
+            JET_COLUMNDEF def = new JET_COLUMNDEF();
+            def.cbStruct = (uint)Marshal.SizeOf(typeof(JET_COLUMNDEF));
+            int err = JetGetTableColumnInfo(_sesid, _table, name, ref def, def.cbStruct, JET_ColInfo);
+            if (err == err_ColumnNotFound) { columnid = 0; return false; }
+            Check(err, "column info " + name);
+            columnid = def.columnid;
+            return true;
+        }
+
+        private void ResolveColumns()
+        {
+            if (_columnsResolved) return;
+            OpenDatatable();
+            _hasSam     = TryGetColumn(Col_SamAccountName, out _colSam);
+            _hasSamType = TryGetColumn(Col_SamAccountType, out _colSamType);
+            _hasUac     = TryGetColumn(Col_UserAccountControl, out _colUac);
+            _hasSid     = TryGetColumn(Col_ObjectSid, out _colSid);
+            _hasNtHash  = TryGetColumn(Col_UnicodePwd, out _colNtHash);
+            _columnsResolved = true;
+        }
+
+        // Returns the raw column value of the current row, or null when the column is absent/null.
+        private byte[] Retrieve(uint columnid)
+        {
+            uint cb;
+            int err = JetRetrieveColumn(_sesid, _table, columnid, null, 0, out cb, 0, IntPtr.Zero);
+            if (err == JET_wrnColumnNull || cb == 0) return null;
+            if (err != err_Success && err != JET_wrnBufferTruncated) Check(err, "retrieve size");
+            byte[] buf = new byte[cb];
+            err = JetRetrieveColumn(_sesid, _table, columnid, buf, cb, out cb, 0, IntPtr.Zero);
+            if (err == JET_wrnColumnNull) return null;
+            if (err != err_Success && err != JET_wrnBufferTruncated) Check(err, "retrieve data");
+            return buf;
+        }
+
+        // Reads core account fields from the current row; null if the row has no sAMAccountName.
+        public AccountRow ReadCurrentAccountRow()
+        {
+            ResolveColumns();
+            if (!_hasSam) return null;
+            byte[] nameBytes = Retrieve(_colSam);
+            if (nameBytes == null) return null;
+
+            AccountRow row = new AccountRow();
+            row.SamAccountName = System.Text.Encoding.Unicode.GetString(nameBytes).TrimEnd('\0');
+
+            byte[] st = _hasSamType ? Retrieve(_colSamType) : null;
+            row.SamAccountType = (st != null && st.Length >= 4) ? BitConverter.ToInt32(st, 0) : 0;
+
+            byte[] uac = _hasUac ? Retrieve(_colUac) : null;
+            row.UserAccountControl = (uac != null && uac.Length >= 4) ? BitConverter.ToInt32(uac, 0) : 0;
+            row.Enabled = (row.UserAccountControl & 0x2) == 0;   // ADS_UF_ACCOUNTDISABLE
+
+            byte[] sid = _hasSid ? Retrieve(_colSid) : null;
+            if (sid != null && sid.Length >= 8)
+            {
+                int n = sid.Length;
+                // ntds.dit stores the RID (last 4 bytes) BIG-endian.
+                row.Rid = ((long)sid[n - 4] << 24) | ((long)sid[n - 3] << 16) | ((long)sid[n - 2] << 8) | (long)sid[n - 1];
+                row.Sid = FormatSid(sid);
+            }
+
+            row.HasNtHash = _hasNtHash && Retrieve(_colNtHash) != null;
+            return row;
+        }
+
+        // B2 deliverable: dump up to `max` account rows (user/machine/trust) for eyeball validation.
+        public System.Collections.Generic.List<AccountRow> DumpAccountRows(int max)
+        {
+            var list = new System.Collections.Generic.List<AccountRow>();
+            if (!MoveFirst()) return list;
+            do
+            {
+                AccountRow row = ReadCurrentAccountRow();
+                if (row != null && IsAccountType(row.SamAccountType))
+                {
+                    list.Add(row);
+                    if (max > 0 && list.Count >= max) break;
+                }
+            } while (MoveNext());
+            return list;
+        }
+
+        private static bool IsAccountType(int t)
+        {
+            // SAM_NORMAL_USER_ACCOUNT / SAM_MACHINE_ACCOUNT / SAM_TRUST_ACCOUNT
+            return t == 0x30000000 || t == 0x30000001 || t == 0x30000002;
+        }
+
+        private static string FormatSid(byte[] sid)
+        {
+            byte[] b = (byte[])sid.Clone();
+            int n = b.Length;
+            // Reverse the big-endian RID back to standard little-endian for display.
+            byte t;
+            t = b[n - 4]; b[n - 4] = b[n - 1]; b[n - 1] = t;
+            t = b[n - 3]; b[n - 3] = b[n - 2]; b[n - 2] = t;
+            byte revision = b[0];
+            int subCount = b[1];
+            long authority = 0;
+            for (int i = 0; i < 6; i++) authority = (authority << 8) | b[2 + i];
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            sb.Append("S-").Append(revision).Append('-').Append(authority);
+            for (int i = 0; i < subCount && 8 + i * 4 + 4 <= b.Length; i++)
+            {
+                sb.Append('-').Append(BitConverter.ToUInt32(b, 8 + i * 4));
+            }
+            return sb.ToString();
+        }
+
         public void Dispose()
         {
             try { if (_tableOpen)   { JetCloseTable(_sesid, _table); _tableOpen = false; } } catch { }
@@ -264,6 +419,27 @@ function Measure-NtdsDatatableRow {
     $resolved = (Resolve-Path -LiteralPath $DatabasePath).Path
     $reader = [AdCredAudit.EseReader]::new($resolved)
     try { $reader.CountDatatableRows() }
+    finally { $reader.Dispose() }
+}
+
+function Get-NtdsAccountRow {
+    # B2 lab probe: dump the first N account rows (name / RID / SID / type / enabled / has-hash).
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$DatabasePath, [int]$First = 20)
+    $resolved = (Resolve-Path -LiteralPath $DatabasePath).Path
+    $reader = [AdCredAudit.EseReader]::new($resolved)
+    try {
+        foreach ($r in $reader.DumpAccountRows($First)) {
+            [PSCustomObject]@{
+                SamAccountName = $r.SamAccountName
+                Rid            = $r.Rid
+                Sid            = $r.Sid
+                Type           = ('0x{0:X8}' -f $r.SamAccountType)
+                Enabled        = $r.Enabled
+                HasNtHash      = $r.HasNtHash
+            }
+        }
+    }
     finally { $reader.Dispose() }
 }
 #endregion ESE Interop
@@ -488,6 +664,12 @@ if ($MyInvocation.InvocationName -ne '.') {
         if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-EseProbe requires -DatabasePath (an offline ntds.dit copy).' }
         $rows = Measure-NtdsDatatableRow -DatabasePath $DatabasePath
         Write-Host ("datatable rows: {0}" -f $rows)
+        return
+    }
+
+    if ($EseDumpAccounts) {
+        if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-EseDumpAccounts requires -DatabasePath (an offline ntds.dit copy).' }
+        Get-NtdsAccountRow -DatabasePath $DatabasePath -First $First | Format-Table -AutoSize
         return
     }
 
