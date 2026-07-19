@@ -250,7 +250,8 @@ function Invoke-SelfTest {
     [CmdletBinding()]
     param()
     $results = [System.Collections.Generic.List[object]]::new()
-    $assert  = { param($name, $cond) $results.Add([PSCustomObject]@{ Test = $name; Passed = [bool]$cond }) }
+    $assert  = { param($name, $cond) $results.Add([PSCustomObject]@{ Test = $name; Passed = [bool]$cond; Skipped = $false }) }
+    $skip    = { param($name, $why) $results.Add([PSCustomObject]@{ Test = "$name (skipped: $why)"; Passed = $true; Skipped = $true }) }
     $Pw = '8846F7EAEE8FB117AD06BDD830B7586C'  # NThash("password")
 
     $accts = @(
@@ -274,20 +275,31 @@ function Invoke-SelfTest {
     $rep = Format-AuditReport -Matched $m -AccountsProcessed 3 -CandidateHashHex @($Pw) -Canary 'canary' -Assurance $pass
     & $assert 'report allowlists canary out of findings' ($rep.MatchCount -eq 1 -and @($rep.MatchedAccounts).Count -eq 1 -and @($rep.MatchedAccounts)[0] -eq 'alice')
 
-    # In-box CNG NT-hash known-answer test (Windows / bcrypt.dll only).
-    try {
-        $kat = ConvertTo-NtHashHex -Password 'password'
-        & $assert "CNG NT-hash KAT  NThash('password')=8846F7EA..." ($kat -eq $Pw)
+    # In-box CNG NT-hash known-answer test — native, Windows-only. Skipped (not failed) elsewhere,
+    # so the portable logic suite can go fully green on a non-Windows dev host (e.g. macOS pwsh 7).
+    $onWindows = (-not (Test-Path Variable:\IsWindows)) -or $IsWindows   # 5.1 has no $IsWindows => Windows
+    if ($onWindows) {
+        try {
+            $kat = ConvertTo-NtHashHex -Password 'password'
+            & $assert "CNG NT-hash KAT  NThash('password')=8846F7EA..." ($kat -eq $Pw)
+        }
+        catch {
+            & $assert 'CNG NT-hash KAT (bcrypt.dll call failed)' $false
+            Write-Warning "CNG MD4 error: $($_.Exception.Message)"
+        }
     }
-    catch {
-        & $assert 'CNG NT-hash KAT (requires Windows/bcrypt.dll)' $false
-        Write-Warning "CNG MD4 unavailable on this host: $($_.Exception.Message)"
+    else {
+        & $skip 'CNG NT-hash KAT' 'non-Windows host, bcrypt.dll unavailable'
     }
 
-    foreach ($r in $results) { Write-Host ('  {0}  {1}' -f $(if ($r.Passed) { 'PASS' } else { 'FAIL' }), $r.Test) }
-    $failed = @($results | Where-Object { -not $_.Passed }).Count
+    foreach ($r in $results) {
+        $tag = if ($r.Skipped) { 'SKIP' } elseif ($r.Passed) { 'PASS' } else { 'FAIL' }
+        Write-Host ('  {0}  {1}' -f $tag, $r.Test)
+    }
+    $failed  = @($results | Where-Object { -not $_.Passed }).Count
+    $skipped = @($results | Where-Object { $_.Skipped }).Count
     if ($failed -gt 0) { throw "SELF-TEST FAILED: $failed of $($results.Count) checks failed." }
-    Write-Host ('SELF-TEST PASSED: {0}/{0} checks.' -f $results.Count)
+    Write-Host ('SELF-TEST PASSED: {0} checks ({1} skipped).' -f $results.Count, $skipped)
 }
 #endregion SelfTest
 
