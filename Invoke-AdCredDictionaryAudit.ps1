@@ -47,7 +47,9 @@ param(
     [switch]$SelfTest,
     [switch]$EseProbe,                     # B1 lab probe: open -DatabasePath read-only and print datatable row count
     [switch]$EseDumpAccounts,              # B2 lab probe: dump the first -First account rows
-    [int]$First = 20
+    [int]$First = 20,
+    [string]$SystemHivePath,               # offline SYSTEM hive copy (boot key source)
+    [switch]$BootKeyProbe                   # B3 lab probe: derive + print the boot key from -SystemHivePath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -444,6 +446,121 @@ function Get-NtdsAccountRow {
 }
 #endregion ESE Interop
 
+#region BootKey Interop — B3: derive the boot key from an offline SYSTEM hive (advapi32, in-box).
+#
+#  LAB NOTES: uses RegLoadAppKey (no SeRestorePrivilege needed, loads a private copy). The hive file
+#  must be WRITABLE (RegLoadAppKey may journal) — copy the snapshot SYSTEM to a writable path first.
+#  The boot-key bytes live in the *class* names of the JD/Skew1/GBG/Data keys (read via RegQueryInfoKey).
+#  Validate by comparing to DSInternals `Get-BootKey -Path <SYSTEM>` on the same hive.
+#
+if (-not ('AdCredAudit.BootKey' -as [type])) {
+    $bootKeySource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace AdCredAudit
+{
+    public static class BootKey
+    {
+        private const uint KEY_READ = 0x20019;
+        private static readonly int[] KeyPermutation = { 8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7 };
+        private static readonly string[] BootKeySubKeys = { "JD", "Skew1", "GBG", "Data" };
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegLoadAppKeyW")]
+        private static extern int RegLoadAppKey(string lpFile, out IntPtr phkResult, uint samDesired, uint dwOptions, uint Reserved);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegOpenKeyExW")]
+        private static extern int RegOpenKeyEx(IntPtr hKey, string lpSubKey, uint ulOptions, uint samDesired, out IntPtr phkResult);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegQueryValueExW")]
+        private static extern int RegQueryValueEx(IntPtr hKey, string lpValueName, IntPtr lpReserved, out uint lpType, byte[] lpData, ref uint lpcbData);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegQueryInfoKeyW")]
+        private static extern int RegQueryInfoKey(IntPtr hKey, StringBuilder lpClass, ref uint lpcchClass, IntPtr lpReserved,
+            out uint lpcSubKeys, out uint lpcbMaxSubKeyLen, out uint lpcbMaxClassLen, out uint lpcValues,
+            out uint lpcbMaxValueNameLen, out uint lpcbMaxValueLen, out uint lpcbSecurityDescriptor, IntPtr lpftLastWriteTime);
+        [DllImport("advapi32.dll")]
+        private static extern int RegCloseKey(IntPtr hKey);
+
+        public static byte[] GetBootKey(string systemHivePath)
+        {
+            IntPtr hHive;
+            int rc = RegLoadAppKey(systemHivePath, out hHive, KEY_READ, 0, 0);
+            if (rc != 0) throw new Exception("RegLoadAppKey failed (" + rc + "). Ensure the path is a writable SYSTEM hive copy, not already loaded.");
+            try
+            {
+                int ccs = GetCurrentControlSet(hHive);
+                string lsaPath = string.Format("ControlSet{0:D3}\\Control\\Lsa", ccs);
+                IntPtr hLsa;
+                rc = RegOpenKeyEx(hHive, lsaPath, 0, KEY_READ, out hLsa);
+                if (rc != 0) throw new Exception("Open " + lsaPath + " failed (" + rc + ").");
+                try
+                {
+                    byte[] scrambled = new byte[16];
+                    for (int i = 0; i < BootKeySubKeys.Length; i++)
+                    {
+                        byte[] part = HexToBytes(GetKeyClass(hLsa, BootKeySubKeys[i]));
+                        Array.Copy(part, 0, scrambled, i * 4, part.Length);
+                    }
+                    byte[] bootKey = new byte[16];
+                    for (int i = 0; i < 16; i++) bootKey[i] = scrambled[KeyPermutation[i]];
+                    return bootKey;
+                }
+                finally { RegCloseKey(hLsa); }
+            }
+            finally { RegCloseKey(hHive); }
+        }
+
+        private static int GetCurrentControlSet(IntPtr hHive)
+        {
+            IntPtr hSelect;
+            if (RegOpenKeyEx(hHive, "Select", 0, KEY_READ, out hSelect) != 0) return 1;   // absent in some copied hives
+            try
+            {
+                uint type; uint cb = 4; byte[] data = new byte[4];
+                if (RegQueryValueEx(hSelect, "Current", IntPtr.Zero, out type, data, ref cb) != 0) return 1;
+                return BitConverter.ToInt32(data, 0);
+            }
+            finally { RegCloseKey(hSelect); }
+        }
+
+        private static string GetKeyClass(IntPtr hParent, string subKeyName)
+        {
+            IntPtr hSub;
+            int rc = RegOpenKeyEx(hParent, subKeyName, 0, KEY_READ, out hSub);
+            if (rc != 0) throw new Exception("Open Lsa\\" + subKeyName + " failed (" + rc + ").");
+            try
+            {
+                StringBuilder cls = new StringBuilder(256);
+                uint cch = (uint)cls.Capacity;
+                uint sk, mskl, mcl, vals, mvnl, mvl, sd;
+                rc = RegQueryInfoKey(hSub, cls, ref cch, IntPtr.Zero, out sk, out mskl, out mcl, out vals, out mvnl, out mvl, out sd, IntPtr.Zero);
+                if (rc != 0) throw new Exception("Query class of " + subKeyName + " failed (" + rc + ").");
+                return cls.ToString();
+            }
+            finally { RegCloseKey(hSub); }
+        }
+
+        private static byte[] HexToBytes(string hex)
+        {
+            byte[] b = new byte[hex.Length / 2];
+            for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+            return b;
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $bootKeySource -Language CSharp
+}
+
+function Get-NtdsBootKey {
+    # B3 lab probe: derive the boot key from an offline SYSTEM hive; returns 32-char lowercase hex.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$SystemHivePath)
+    $resolved = (Resolve-Path -LiteralPath $SystemHivePath).Path
+    $bytes = [AdCredAudit.BootKey]::GetBootKey($resolved)
+    -join ($bytes | ForEach-Object { $_.ToString('x2') })
+}
+#endregion BootKey Interop
+
 #region Extract — the pluggable seam. Contract: AccountSecret = { SamAccountName, Rid, NtHashHex, Enabled }.
 function Get-AccountSecret {
     # Lab-gated (Phase B): read the offline ntds.dit and decrypt each NT hash using in-box esent.dll
@@ -670,6 +787,12 @@ if ($MyInvocation.InvocationName -ne '.') {
     if ($EseDumpAccounts) {
         if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-EseDumpAccounts requires -DatabasePath (an offline ntds.dit copy).' }
         Get-NtdsAccountRow -DatabasePath $DatabasePath -First $First | Format-Table -AutoSize
+        return
+    }
+
+    if ($BootKeyProbe) {
+        if ([string]::IsNullOrWhiteSpace($SystemHivePath)) { throw '-BootKeyProbe requires -SystemHivePath (an offline SYSTEM hive copy).' }
+        Write-Host ("boot key: {0}" -f (Get-NtdsBootKey -SystemHivePath $SystemHivePath))
         return
     }
 
