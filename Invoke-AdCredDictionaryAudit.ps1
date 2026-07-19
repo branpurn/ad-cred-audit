@@ -51,7 +51,7 @@ $ErrorActionPreference = 'Stop'
 
 #region Interop — in-box native crypto (OEM Tier-1). NT hash via the CNG MD4 provider in bcrypt.dll.
 if (-not ('AdCredAudit.NtHash' -as [type])) {
-@'
+    $ntHashSource = @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -90,7 +90,8 @@ namespace AdCredAudit
         }
     }
 }
-'@ | Add-Type -Language CSharp
+'@
+    Add-Type -TypeDefinition $ntHashSource -Language CSharp
 }
 #endregion Interop
 
@@ -159,7 +160,9 @@ function Find-DictionaryMatch {
         $key = $c.ToUpperInvariant()
         if ($HashMap.ContainsKey($key)) { foreach ($sam in $HashMap[$key]) { [void]$hits.Add($sam) } }
     }
-    ,$hits
+    # Emit the matched names as a normal enumeration (sorted, de-duplicated by the SortedSet) so both
+    # `$x = Find-DictionaryMatch ...` and inline `@(Find-DictionaryMatch ...)` behave identically.
+    $hits
 }
 #endregion Match
 
