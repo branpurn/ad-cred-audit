@@ -19,8 +19,13 @@ live DC. A first-party PowerShell module:
 
 - **OEM-first.** Built from Microsoft parts only — in-box Windows APIs (`esent.dll`, CNG/`advapi32`
   crypto, `ntdsutil`) and the .NET Framework BCL. No third-party dependencies (no DSInternals).
-- **PowerShell.** Delivered and operated as a PowerShell module. Native calls go through `Add-Type`
-  P/Invoke to in-box DLLs — still PowerShell.
+  Microsoft prerequisites (.NET Framework, the RSAT ActiveDirectory module) are installed
+  out-of-band; we ship no third-party code.
+- **Single `.ps1` — not a module.** The entire tool is one self-contained script: PowerShell
+  orchestration + embedded C# compiled at runtime via `Add-Type` (this is how the native `esent.dll`
+  reader and CNG MD4 hasher fit in one file). No `.psm1`, no dot-sourced components, nothing to
+  `Import-Module`. It can be a large file; it stays one file. A built-in `-SelfTest` switch runs the
+  known-answer tests with no external framework.
 
 ## Why the risk is acceptable
 
@@ -39,6 +44,8 @@ breach-corpus/HIBP, no cracking rules, no online testing.
 
 ## Status
 
-Pre-lab proof-of-concept. The matcher, dictionary hasher, and canary self-test are buildable and
-testable now (synthetic fixtures + NT-hash known-answer vectors). The `ntds.dit` reader/decryptor is
-built and validated in a Windows lab.
+Pre-lab proof-of-concept, delivered as the single script `Invoke-AdCredDictionaryAudit.ps1`. The
+matcher, dictionary hasher, assurance gate, reporter, and `-SelfTest` are built; the `ntds.dit`
+reader/decryptor (the `Get-AccountSecret` region) is stubbed and lab-gated. Run `-SelfTest` on a
+Windows host to validate the logic + the in-box CNG NT-hash KAT; use `-FixturePath` to exercise the
+full pipeline offline against a JSON account fixture.
