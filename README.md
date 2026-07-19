@@ -1,30 +1,31 @@
 # ad-cred-audit-poc
 
-Offline, retroactive Active Directory **custom-dictionary** password audit — discovers accounts
-whose current password appears in an operator-supplied dictionary, across the whole directory,
-**without authenticating** (no lockouts).
+Offline Active Directory **custom-dictionary** password audit — discovers accounts whose current
+password appears in an operator-supplied dictionary, across the whole domain, **without
+authenticating** (no lockouts).
 
-> **Start here:** [`docs/CONOP.md`](docs/CONOP.md) — the concept of operations: goals, trade-space
-> rationale, architecture, operational workflow, assurance model, and phased delivery.
+> **Start here:** [`docs/EXECUTIVE-SUMMARY.md`](docs/EXECUTIVE-SUMMARY.md).
 
 ## One-paragraph architecture
 
-Work from an **offline IFM snapshot** of `ntds.dit`. A **pluggable extractor** (DSInternals
-black-box for the POC; an owned static-file extractor possible later) emits
-`{SamAccountName, RID, NTHash, Enabled}` records behind a fixed contract. Everything downstream is
-extractor-agnostic: the **candidate hasher** NT-hashes each dictionary word (in-box CNG MD4), the
-**matcher** looks them up against the account hashes, and a **fail-closed assurance gate**
-(positive canary + count reconcile) makes silent under-reporting impossible before anything is
-reported.
+A first-party **PowerShell module** works against an **offline copy** of `ntds.dit`
+(replication/IFM snapshot). It reads the database and decrypts each account's NT hash using
+**in-box/OEM components only** (no DSInternals), NT-hashes each dictionary word (in-box CNG MD4),
+matches them against the account hashes, and reports the hits. A fail-closed **canary** guards
+against silent false negatives.
+
+## Principles (fixed unless explicitly changed)
+
+- **OEM-first** — Microsoft parts only: in-box Windows APIs + .NET Framework BCL. No third-party deps.
+- **PowerShell** — delivered as a PowerShell module; native calls via `Add-Type` P/Invoke.
 
 ## Status
 
-Pre-lab proof-of-concept. Phase A components (contract, matcher, hasher, assurance harness,
-reporter) are buildable and unit-testable now with synthetic fixtures; the extractor and end-to-end
-run are lab-gated. See CONOP §10–§11.
+Pre-lab proof-of-concept. The matcher, dictionary hasher, and canary self-test are buildable/testable
+now (synthetic fixtures + NT-hash known-answer vectors); the `ntds.dit` reader/decryptor is lab-gated.
 
 ## Related folders
 
-- `../ad-cred-audit` — upstream DSInternals (source of truth for the extractor).
-- `../ad-cred-audit-de-minimis-wip` — trimmed C# dictionary-match cmdlet; reference for the matcher
-  logic ported here.
+- `../ad-cred-audit` — upstream DSInternals; **reference only** for how the extraction works (not a
+  dependency).
+- `../ad-cred-audit-de-minimis-wip` — trimmed dictionary-match cmdlet; reference for the matcher logic.
