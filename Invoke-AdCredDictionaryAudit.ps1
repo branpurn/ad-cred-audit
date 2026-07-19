@@ -49,7 +49,8 @@ param(
     [switch]$EseDumpAccounts,              # B2 lab probe: dump the first -First account rows
     [int]$First = 20,
     [string]$SystemHivePath,               # offline SYSTEM hive copy (boot key source)
-    [switch]$BootKeyProbe                   # B3 lab probe: derive + print the boot key from -SystemHivePath
+    [switch]$BootKeyProbe,                  # B3 lab probe: derive + print the boot key from -SystemHivePath
+    [switch]$PekProbe                       # B4 lab probe: decrypt + summarize the PEK list
 )
 
 $ErrorActionPreference = 'Stop'
@@ -215,8 +216,8 @@ namespace AdCredAudit
 
         // ---- B2 column state (resolved once, lazily) ----
         private bool _columnsResolved;
-        private uint _colSam, _colSamType, _colUac, _colSid, _colNtHash;
-        private bool _hasSam, _hasSamType, _hasUac, _hasSid, _hasNtHash;
+        private uint _colSam, _colSamType, _colUac, _colSid, _colNtHash, _colPek;
+        private bool _hasSam, _hasSamType, _hasUac, _hasSid, _hasNtHash, _hasPek;
 
         public static string ErrName(int code)
         {
@@ -310,6 +311,7 @@ namespace AdCredAudit
             _hasUac     = TryGetColumn(Col_UserAccountControl, out _colUac);
             _hasSid     = TryGetColumn(Col_ObjectSid, out _colSid);
             _hasNtHash  = TryGetColumn(Col_UnicodePwd, out _colNtHash);
+            _hasPek     = TryGetColumn(Col_PekList, out _colPek);
             _columnsResolved = true;
         }
 
@@ -379,6 +381,20 @@ namespace AdCredAudit
         {
             // SAM_NORMAL_USER_ACCOUNT / SAM_MACHINE_ACCOUNT / SAM_TRUST_ACCOUNT
             return t == 0x30000000 || t == 0x30000001 || t == 0x30000002;
+        }
+
+        // B4: the encrypted PEK list sits on the domain NC head — the single row with a non-null pekList.
+        public byte[] FindPekListBlob()
+        {
+            ResolveColumns();
+            if (!_hasPek) throw new Exception("pekList column (ATTk590689) not found in datatable.");
+            if (!MoveFirst()) return null;
+            do
+            {
+                byte[] blob = Retrieve(_colPek);
+                if (blob != null && blob.Length > 24) return blob;
+            } while (MoveNext());
+            return null;
         }
 
         private static string FormatSid(byte[] sid)
@@ -560,6 +576,171 @@ function Get-NtdsBootKey {
     -join ($bytes | ForEach-Object { $_.ToString('x2') })
 }
 #endregion BootKey Interop
+
+#region Secret Crypto — B4/B5: PEK list + secret decryption (advapi32 RC4 + BCL MD5/AES, in-box).
+#
+#  LAB NOTES: RC4 is advapi32 SystemFunction032 (== SystemFunction033; RC4 is symmetric — swap if one
+#  export is missing). AES path is CBC/PKCS7, IV=salt, key=bootKey/PEK (mirrors DSInternals). A VALID
+#  PEK signature GUID after decryption is a strong end-to-end check on the boot key + RC4/AES path.
+#
+if (-not ('AdCredAudit.Secret' -as [type])) {
+    $secretSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+
+namespace AdCredAudit
+{
+    public sealed class PekList
+    {
+        public int Version;
+        public int Flags;
+        public int CurrentKeyIndex;
+        public byte[][] Keys;
+        public bool SignatureValid;
+        public int KeyCount { get { return Keys == null ? 0 : Keys.Length; } }
+        public string VersionName { get { return Version == 3 ? "W2016 (AES)" : Version == 2 ? "W2k (RC4)" : ("v" + Version); } }
+        public byte[] Key(int index) { return (Keys != null && index >= 0 && index < Keys.Length) ? Keys[index] : null; }
+    }
+
+    public static class Secret
+    {
+        // PEK list signature GUID {4881d956-91ec-11d1-905a-00c04fc2d4cf} in stored byte order.
+        private static readonly byte[] PekSignature = new Guid("4881d956-91ec-11d1-905a-00c04fc2d4cf").ToByteArray();
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct USTRING { public int Length; public int MaximumLength; public IntPtr Buffer; }
+
+        // RC4 (symmetric) via the in-box LSA helper.
+        [DllImport("advapi32.dll", EntryPoint = "SystemFunction032")]
+        private static extern int SystemFunction032(ref USTRING data, ref USTRING key);
+
+        public static byte[] Rc4(byte[] data, byte[] key)
+        {
+            byte[] result = (byte[])data.Clone();
+            GCHandle hData = GCHandle.Alloc(result, GCHandleType.Pinned);
+            GCHandle hKey  = GCHandle.Alloc(key, GCHandleType.Pinned);
+            try
+            {
+                USTRING d = new USTRING(); d.Length = result.Length; d.MaximumLength = result.Length; d.Buffer = hData.AddrOfPinnedObject();
+                USTRING k = new USTRING(); k.Length = key.Length;    k.MaximumLength = key.Length;    k.Buffer = hKey.AddrOfPinnedObject();
+                int st = SystemFunction032(ref d, ref k);
+                if (st != 0) throw new Exception(string.Format("SystemFunction032 (RC4) failed: 0x{0:X8}", st));
+                return result;
+            }
+            finally { hData.Free(); hKey.Free(); }
+        }
+
+        // MD5(key || salt x rounds) — mirrors DSInternals ComputeMD5.
+        public static byte[] ComputeMd5(byte[] key, byte[] salt, int rounds)
+        {
+            using (MD5 md5 = MD5.Create())
+            {
+                md5.TransformBlock(key, 0, key.Length, null, 0);
+                for (int i = 1; i < rounds; i++) md5.TransformBlock(salt, 0, salt.Length, null, 0);
+                md5.TransformFinalBlock(salt, 0, salt.Length);
+                return md5.Hash;
+            }
+        }
+
+        public static byte[] DecryptRc4WithSalt(byte[] data, byte[] salt, byte[] key, int rounds)
+        {
+            return Rc4(data, ComputeMd5(key, salt, rounds));
+        }
+
+        public static byte[] DecryptAesCbc(byte[] data, byte[] iv, byte[] key)
+        {
+            using (Aes aes = Aes.Create())
+            {
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+                using (ICryptoTransform dec = aes.CreateDecryptor(key, iv))
+                    return dec.TransformFinalBlock(data, 0, data.Length);
+            }
+        }
+
+        // Version(4)|Flags(4)|Salt(16)|Encrypted... ; W2k=RC4(1000 rounds), W2016=AES(strip trailing 16B).
+        public static PekList DecryptPekList(byte[] blob, byte[] bootKey)
+        {
+            int version = BitConverter.ToInt32(blob, 0);
+            int flags   = BitConverter.ToInt32(blob, 4);
+            byte[] salt = new byte[16]; Array.Copy(blob, 8, salt, 0, 16);
+            byte[] enc = new byte[blob.Length - 24]; Array.Copy(blob, 24, enc, 0, enc.Length);
+
+            byte[] cleartext;
+            if (flags == 1)
+            {
+                if (version == 2) cleartext = DecryptRc4WithSalt(enc, salt, bootKey, 1000);
+                else if (version == 3)
+                {
+                    byte[] trimmed = new byte[enc.Length - 16]; Array.Copy(enc, 0, trimmed, 0, trimmed.Length);
+                    cleartext = DecryptAesCbc(trimmed, salt, bootKey);
+                }
+                else throw new Exception("Unsupported PEK list version: " + version);
+            }
+            else cleartext = enc;
+
+            return ParsePekList(cleartext, version, flags);
+        }
+
+        // Signature(16)|LastGenerated(8)|CurrentKey(4)|KeyCount(4)|{KeyId(4)|Key(16)}
+        private static PekList ParsePekList(byte[] blob, int version, int flags)
+        {
+            PekList pek = new PekList(); pek.Version = version; pek.Flags = flags;
+            byte[] sig = new byte[16]; Array.Copy(blob, 0, sig, 0, 16);
+            pek.SignatureValid = ByteEquals(sig, PekSignature);
+            pek.CurrentKeyIndex = BitConverter.ToInt32(blob, 24);
+            int numKeys = BitConverter.ToInt32(blob, 28);
+            if (numKeys < 0 || numKeys > 1024) throw new Exception("Implausible PEK key count (" + numKeys + ") - wrong boot key or failed decryption.");
+            pek.Keys = new byte[numKeys][];
+            int off = 32;
+            for (int i = 0; i < numKeys; i++)
+            {
+                int keyId = BitConverter.ToInt32(blob, off); off += 4;
+                byte[] key = new byte[16]; Array.Copy(blob, off, key, 0, 16); off += 16;
+                if (keyId >= 0 && keyId < numKeys) pek.Keys[keyId] = key;
+            }
+            return pek;
+        }
+
+        private static bool ByteEquals(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $secretSource -Language CSharp
+}
+
+function Resolve-AuditBootKey {
+    [CmdletBinding()]
+    param([string]$BootKey, [string]$SystemHivePath)
+    if ($SystemHivePath) {
+        return [AdCredAudit.BootKey]::GetBootKey((Resolve-Path -LiteralPath $SystemHivePath).Path)
+    }
+    if ($BootKey) {
+        $hex = ($BootKey -replace '[^0-9A-Fa-f]', '')
+        if ($hex.Length -ne 32) { throw "BootKey must be 32 hex chars (16 bytes); got $($hex.Length)." }
+        $b = New-Object byte[] 16
+        for ($i = 0; $i -lt 16; $i++) { $b[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
+        return $b
+    }
+    throw 'Provide -SystemHivePath (offline SYSTEM hive) or -BootKey (32-hex).'
+}
+
+function Get-NtdsPekList {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$DatabasePath, [string]$SystemHivePath, [string]$BootKey)
+    $bootKeyBytes = Resolve-AuditBootKey -BootKey $BootKey -SystemHivePath $SystemHivePath
+    $reader = [AdCredAudit.EseReader]::new((Resolve-Path -LiteralPath $DatabasePath).Path)
+    try { $blob = $reader.FindPekListBlob() } finally { $reader.Dispose() }
+    if (-not $blob) { throw 'No pekList blob found in the datatable.' }
+    [AdCredAudit.Secret]::DecryptPekList($blob, $bootKeyBytes)
+}
+#endregion Secret Crypto
 
 #region Extract — the pluggable seam. Contract: AccountSecret = { SamAccountName, Rid, NtHashHex, Enabled }.
 function Get-AccountSecret {
@@ -793,6 +974,19 @@ if ($MyInvocation.InvocationName -ne '.') {
     if ($BootKeyProbe) {
         if ([string]::IsNullOrWhiteSpace($SystemHivePath)) { throw '-BootKeyProbe requires -SystemHivePath (an offline SYSTEM hive copy).' }
         Write-Host ("boot key: {0}" -f (Get-NtdsBootKey -SystemHivePath $SystemHivePath))
+        return
+    }
+
+    if ($PekProbe) {
+        if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-PekProbe requires -DatabasePath (and -SystemHivePath or -BootKey).' }
+        $pek = Get-NtdsPekList -DatabasePath $DatabasePath -SystemHivePath $SystemHivePath -BootKey $BootKey
+        [PSCustomObject]@{
+            Version         = $pek.VersionName
+            FlagsEncrypted  = ($pek.Flags -eq 1)
+            SignatureValid  = $pek.SignatureValid
+            KeyCount        = $pek.KeyCount
+            CurrentKeyIndex = $pek.CurrentKeyIndex
+        } | Format-List
         return
     }
 
