@@ -83,7 +83,6 @@ controller using the probes above before use.
 
 ## Documentation
 
-- [`docs/EXECUTIVE-SUMMARY.md`](docs/EXECUTIVE-SUMMARY.md) — goals, approach, and design decisions.
 - [`docs/EXTRACTOR-SPEC.md`](docs/EXTRACTOR-SPEC.md) — internals of the offline `ntds.dit` extraction.
 
 ## License
