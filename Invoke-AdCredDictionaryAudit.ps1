@@ -420,23 +420,27 @@ namespace AdCredAudit
         public ExtractionData ReadAllForExtraction(int max)
         {
             ResolveColumns();
+            // n2: distinguish "pekList column absent from schema" (precise error here) from the PS-side
+            // "column present but no row carried a value" case.
+            if (!_hasPek) throw new Exception("pekList column (ATTk590689) not found in datatable.");
             ExtractionData data = new ExtractionData();
             data.Accounts = new System.Collections.Generic.List<AccountRow>();
             if (!MoveFirst()) return data;
             do
             {
-                if (data.PekListBlob == null && _hasPek)
+                if (data.PekListBlob == null)
                 {
                     byte[] pek = Retrieve(_colPek);
                     if (pek != null && pek.Length > 24) data.PekListBlob = pek;
                 }
-                AccountRow row = ReadCurrentAccountRow();
-                if (row != null && IsAccountType(row.SamAccountType))
+                // n3: stop ADDING once the cap is reached (so we never return more than `max`), but keep
+                // scanning until the PEK is captured, so a small cap never starves decryption.
+                if (max <= 0 || data.Accounts.Count < max)
                 {
-                    data.Accounts.Add(row);
-                    // Honor the row cap only once the PEK is in hand, so a cap never starves decryption.
-                    if (max > 0 && data.Accounts.Count >= max && data.PekListBlob != null) break;
+                    AccountRow row = ReadCurrentAccountRow();
+                    if (row != null && IsAccountType(row.SamAccountType)) data.Accounts.Add(row);
                 }
+                if (max > 0 && data.Accounts.Count >= max && data.PekListBlob != null) break;
             } while (MoveNext());
             return data;
         }
