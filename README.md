@@ -23,8 +23,8 @@ hive — for example an `ntdsutil` IFM snapshot), so it never touches a live dom
 
 - A Windows host with Windows PowerShell 5.1 or PowerShell 7.
 - An offline copy of `ntds.dit` and its matching `SYSTEM` registry hive.
-- *Optional:* the Microsoft `ActiveDirectory` (RSAT) module, to obtain the expected account count for
-  the reconcile check.
+- *Optional:* the Microsoft `ActiveDirectory` (RSAT) module, if you want to pass `-ExpectedCount` for
+  the additional account-level cross-check (truncation protection is automatic and needs neither).
 
 ## Quick start
 
@@ -63,8 +63,9 @@ clear." Two guards make that impossible to miss:
 
 - **Canary (fail-closed).** Seed a low-privilege account whose password is in the dictionary. If the
   run doesn't flag it, the run aborts as untrustworthy instead of certifying the results.
-- **Count reconcile.** Supply `-ExpectedCount`; if the run processes fewer accounts than expected
-  (e.g. a truncated read), it fails closed.
+- **Read-completeness (automatic).** The run verifies it walked every record in the database (the
+  engine's own record count vs. rows actually read) and fails closed on a short read — no operator
+  input required. Optionally supply `-ExpectedCount` for an additional account-level cross-check.
 
 Each stage can also be checked in isolation against a snapshot with the built-in probes:
 `-EseProbe`, `-EseDumpAccounts`, `-BootKeyProbe`, `-PekProbe`, and `-HashProbe`.

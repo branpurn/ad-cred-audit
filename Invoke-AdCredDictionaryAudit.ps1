@@ -43,7 +43,7 @@ param(
                                            # so -SelfTest and dot-sourcing don't trigger a prompt)
     [switch]$IncludeDisabledAccounts,
     [switch]$IncludeComputerAccounts,      # include machine/trust accounts (default: user accounts only)
-    [int]$ExpectedCount = -1,
+    [int]$ExpectedCount = -1,              # optional account-level cross-check; truncation is guarded automatically
     [string]$FixturePath,                  # dev: load AccountSecret records from JSON instead of extracting
     [switch]$SelfTest,
     [switch]$EseProbe,                     # B1 lab probe: open -DatabasePath read-only and print datatable row count
@@ -147,6 +147,8 @@ namespace AdCredAudit
     {
         public byte[] PekListBlob;
         public System.Collections.Generic.List<AccountRow> Accounts;
+        public long RowsWalked;      // rows our iteration actually visited
+        public long TableRowCount;   // ESE's own record count (JetIndexRecordCount); 0 if unavailable
     }
 
     // B1 scope: open + count datatable rows. MoveFirst/MoveNext are public for the B2+ column-retrieval work.
@@ -206,6 +208,8 @@ namespace AdCredAudit
         private static extern int JetOpenTable(IntPtr sesid, uint dbid, string szTableName, IntPtr pvParameters, uint cbParameters, uint grbit, out IntPtr tableid);
         [DllImport("esent.dll")]
         private static extern int JetMove(IntPtr sesid, IntPtr tableid, int cRow, uint grbit);
+        [DllImport("esent.dll")]
+        private static extern int JetIndexRecordCount(IntPtr sesid, IntPtr tableid, out uint pcrec, uint crecMax);
         [DllImport("esent.dll")]
         private static extern int JetCloseTable(IntPtr sesid, IntPtr tableid);
         [DllImport("esent.dll")]
@@ -425,9 +429,17 @@ namespace AdCredAudit
             if (!_hasPek) throw new Exception("pekList column (ATTk590689) not found in datatable.");
             ExtractionData data = new ExtractionData();
             data.Accounts = new System.Collections.Generic.List<AccountRow>();
+
+            // Independent record count for the completeness (truncation) check. ESE's own index walk,
+            // so it catches a bug in OUR MoveNext loop. Left at 0 (check skipped) if the API is unavailable.
+            uint total;
+            if (JetIndexRecordCount(_sesid, _table, out total, 0xFFFFFFFF) == err_Success) data.TableRowCount = total;
+
             if (!MoveFirst()) return data;
+            long walked = 0;
             do
             {
+                walked++;
                 if (data.PekListBlob == null)
                 {
                     byte[] pek = Retrieve(_colPek);
@@ -442,6 +454,7 @@ namespace AdCredAudit
                 }
                 if (max > 0 && data.Accounts.Count >= max && data.PekListBlob != null) break;
             } while (MoveNext());
+            data.RowsWalked = walked;
             return data;
         }
 
@@ -874,6 +887,14 @@ function Get-NtdsAccountHash {
     $reader = [AdCredAudit.EseReader]::new((Resolve-Path -LiteralPath $DatabasePath).Path)
     try {
         $ext = $reader.ReadAllForExtraction($First)   # L7: one datatable pass for PEK + accounts
+
+        # Automatic truncation guard: on a full read, verify our iteration walked every datatable row
+        # (ESE's own count vs. rows visited). Self-contained; needs no operator-supplied -ExpectedCount.
+        # Skipped when a -First cap is set (deliberate partial read) or the count API returned nothing.
+        if ($First -le 0 -and $ext.TableRowCount -gt 0 -and $ext.RowsWalked -lt $ext.TableRowCount) {
+            throw ('Datatable read incomplete: walked {0} of {1} rows - possible enumeration truncation (fail-closed).' -f $ext.RowsWalked, $ext.TableRowCount)
+        }
+
         if (-not $ext.PekListBlob) { throw 'No pekList blob found in the datatable.' }
         $pek = [AdCredAudit.Secret]::DecryptPekList($ext.PekListBlob, $bootKeyBytes)
         if (-not $pek.SignatureValid) {
@@ -1012,10 +1033,11 @@ function Test-AuditAssurance {
         $failures.Add("Canary '$CanarySamAccountName' was NOT flagged — extraction/match pipeline is untrustworthy (fail-closed).")
     }
 
-    # Count reconcile — the guard is against enumeration TRUNCATION (reading FEWER rows than exist), so
-    # fail closed only when we processed fewer than expected. Processing MORE is a benign scope/
-    # enumeration difference vs. the operator's Get-ADUser count (krbtgt, built-ins, the canary, disabled
-    # accounts, objectClass edge cases) and only warns — exact-match here would spuriously fail healthy runs.
+    # Optional account-level cross-check. Truncation is already guarded automatically during extraction
+    # (rows-walked vs. the DB's own record count), so -ExpectedCount is a supplementary sanity check
+    # against an operator-known number. Fail closed only when we processed FEWER than expected; processing
+    # MORE is a benign scope/enumeration difference vs. Get-ADUser (krbtgt, built-ins, canary, disabled,
+    # objectClass edge cases) and only warns — exact-match here would spuriously fail healthy runs.
     if ($ExpectedCount -ge 0) {
         if ($ProcessedCount -lt $ExpectedCount) {
             $failures.Add("Count reconcile failed: processed $ProcessedCount, fewer than the $ExpectedCount expected - possible enumeration truncation (fail-closed).")
