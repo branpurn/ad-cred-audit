@@ -3,7 +3,8 @@
 Fills the one stubbed region in `Invoke-AdCredDictionaryAudit.ps1`. Turns an **offline copy** of
 `ntds.dit` + the `SYSTEM` hive into a stream of `AccountSecret` records for the (already-validated)
 downstream pipeline. This is the hard, correctness-critical part; every mechanic below is grounded in
-the proven DSInternals `DataStore` reference (`../ad-cred-audit/Src/DSInternals.DataStore`).
+the documented `ntds.dit` format as implemented by the open-source [DSInternals](https://github.com/MichaelGrafnetter/DSInternals)
+`DataStore` project, used here as a reference for the on-disk structures and crypto.
 
 ## 1. Scope
 
