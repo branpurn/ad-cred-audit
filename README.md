@@ -45,6 +45,9 @@ ntdsutil "activate instance ntds" "ifm" "create full C:\snapshot" quit quit
     -ExpectedCount  4210
 ```
 
+> `-Canary` is required and must name a **canary account** whose password is in your dictionary —
+> create one first (see [Assurance](#assurance)). Without a valid canary the run fails closed.
+
 The result is a report listing the matched accounts, the number processed, a dictionary fingerprint
 (the wordlist is never written to the report), and the assurance verdict.
 
