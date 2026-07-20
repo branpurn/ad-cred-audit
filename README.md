@@ -66,7 +66,19 @@ A broken extraction fails *silently* — it decrypts to noise, matches nothing, 
 clear." Two guards make that impossible to miss:
 
 - **Canary (fail-closed).** Seed a low-privilege account whose password is in the dictionary. If the
-  run doesn't flag it, the run aborts as untrustworthy instead of certifying the results.
+  run doesn't flag it, the run aborts as untrustworthy instead of certifying the results. Create one
+  on a DC (elevated, requires the `ActiveDirectory` module) — disabled, so it can never be used to
+  authenticate, while the audit still reads its stored hash:
+
+  ```powershell
+  New-ADUser -Name svc-canary -SamAccountName svc-canary `
+    -AccountPassword (Read-Host -AsSecureString -Prompt 'Canary password (must be a word in your dictionary)') `
+    -Enabled $false -PasswordNeverExpires $true -CannotChangePassword $true -AccountNotDelegated $true `
+    -Description 'AUTHORIZED audit canary - weak password by design; disabled (no logon); do not remediate or delete'
+  ```
+
+  Pass its name to the audit as `-Canary svc-canary`, and make sure its password is one of the words
+  in your dictionary.
 - **Read-completeness (automatic).** The run verifies it walked every record in the database (the
   engine's own record count vs. rows actually read) and fails closed on a short read — no operator
   input required. Optionally supply `-ExpectedCount` for an additional account-level cross-check.
