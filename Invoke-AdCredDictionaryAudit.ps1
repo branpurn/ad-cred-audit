@@ -143,6 +143,12 @@ namespace AdCredAudit
         public byte[] NtHashBlob;   // raw encrypted unicodePwd blob (decrypted in PS via Secret.DecryptNtHash)
     }
 
+    public sealed class ExtractionData
+    {
+        public byte[] PekListBlob;
+        public System.Collections.Generic.List<AccountRow> Accounts;
+    }
+
     // B1 scope: open + count datatable rows. MoveFirst/MoveNext are public for the B2+ column-retrieval work.
     public sealed class EseReader : IDisposable
     {
@@ -407,6 +413,32 @@ namespace AdCredAudit
                 if (blob != null && blob.Length > 24) return blob;
             } while (MoveNext());
             return null;
+        }
+
+        // L7: single datatable pass capturing BOTH the pekList blob and the account rows, so the main
+        // extraction no longer scans the table twice (FindPekListBlob + DumpAccountRows).
+        public ExtractionData ReadAllForExtraction(int max)
+        {
+            ResolveColumns();
+            ExtractionData data = new ExtractionData();
+            data.Accounts = new System.Collections.Generic.List<AccountRow>();
+            if (!MoveFirst()) return data;
+            do
+            {
+                if (data.PekListBlob == null && _hasPek)
+                {
+                    byte[] pek = Retrieve(_colPek);
+                    if (pek != null && pek.Length > 24) data.PekListBlob = pek;
+                }
+                AccountRow row = ReadCurrentAccountRow();
+                if (row != null && IsAccountType(row.SamAccountType))
+                {
+                    data.Accounts.Add(row);
+                    // Honor the row cap only once the PEK is in hand, so a cap never starves decryption.
+                    if (max > 0 && data.Accounts.Count >= max && data.PekListBlob != null) break;
+                }
+            } while (MoveNext());
+            return data;
         }
 
         private static string FormatSid(byte[] sid)
@@ -837,14 +869,14 @@ function Get-NtdsAccountHash {
     $bootKeyBytes = Resolve-AuditBootKey -BootKey $BootKey -SystemHivePath $SystemHivePath
     $reader = [AdCredAudit.EseReader]::new((Resolve-Path -LiteralPath $DatabasePath).Path)
     try {
-        $blob = $reader.FindPekListBlob()
-        if (-not $blob) { throw 'No pekList blob found in the datatable.' }
-        $pek = [AdCredAudit.Secret]::DecryptPekList($blob, $bootKeyBytes)
+        $ext = $reader.ReadAllForExtraction($First)   # L7: one datatable pass for PEK + accounts
+        if (-not $ext.PekListBlob) { throw 'No pekList blob found in the datatable.' }
+        $pek = [AdCredAudit.Secret]::DecryptPekList($ext.PekListBlob, $bootKeyBytes)
         if (-not $pek.SignatureValid) {
             throw 'PEK signature invalid - boot key or decryption is wrong; refusing to emit hashes (fail-closed).'
         }
         $failures = [System.Collections.Generic.List[string]]::new()
-        foreach ($r in $reader.DumpAccountRows($First)) {
+        foreach ($r in $ext.Accounts) {
             if (-not $r.NtHashBlob) { continue }
             if (-not $IncludeComputerAccounts -and $r.SamAccountType -ne 0x30000000) { continue }
             if (-not $IncludeDisabledAccounts  -and -not $r.Enabled) { continue }
@@ -912,7 +944,9 @@ function ConvertTo-NtHashHex {
     [CmdletBinding()]
     param([Parameter(Mandatory, ValueFromPipeline)][AllowEmptyString()][string]$Password)
     process {
-        if ($null -eq $Password) { return }
+        # L6: skip empty candidates (e.g. blank dictionary lines) so they don't flag empty-password
+        # accounts as a dictionary "match". Whitespace-only entries are kept (could be intentional).
+        if ([string]::IsNullOrEmpty($Password)) { return }
         $bytes = [AdCredAudit.NtHash]::Compute($Password)
         ([System.BitConverter]::ToString($bytes) -replace '-', '').ToUpperInvariant()
     }
@@ -1130,8 +1164,10 @@ if ($MyInvocation.InvocationName -ne '.') {
 
     if ($HashProbe) {
         if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-HashProbe requires -DatabasePath (and -SystemHivePath or -BootKey).' }
+        # L8: default to ALL accounts so the canary is included; honor -First only if explicitly given.
+        $hashFirst = if ($PSBoundParameters.ContainsKey('First')) { $First } else { 0 }
         Get-NtdsAccountHash -DatabasePath $DatabasePath -SystemHivePath $SystemHivePath -BootKey $BootKey `
-            -First $First -IncludeDisabledAccounts:$IncludeDisabledAccounts `
+            -First $hashFirst -IncludeDisabledAccounts:$IncludeDisabledAccounts `
             -IncludeComputerAccounts:$IncludeComputerAccounts | Format-Table -AutoSize
         return
     }
@@ -1154,12 +1190,26 @@ if ($MyInvocation.InvocationName -ne '.') {
     })
     if (-not $IncludeDisabledAccounts) { $accounts = @($accounts | Where-Object { $_.Enabled -or $_.IsCanary }) }
 
-    # 2. Dictionary -> candidate NT hashes (in-box CNG MD4).
-    $words = @()
-    if ($Dictionary)     { $words += $Dictionary }
-    if ($DictionaryFile) { $words += Get-Content -LiteralPath $DictionaryFile }
-    if (-not $words)     { throw 'No dictionary provided (-Dictionary and/or -DictionaryFile).' }
-    $candidates = @($words | ConvertTo-NtHashHex)
+    # 2. Dictionary -> unique candidate NT hashes (in-box CNG MD4). L5: the file is streamed line by
+    #    line (not fully loaded), and candidates are de-duplicated so repeats don't inflate work or the
+    #    fingerprint.
+    if (-not $Dictionary -and -not $DictionaryFile) {
+        throw 'No dictionary provided (-Dictionary and/or -DictionaryFile).'
+    }
+    $candidateSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($Dictionary) {
+        foreach ($w in $Dictionary) { $h = ConvertTo-NtHashHex -Password $w; if ($h) { [void]$candidateSet.Add($h) } }
+    }
+    if ($DictionaryFile) {
+        $dictPath = (Resolve-Path -LiteralPath $DictionaryFile).Path
+        foreach ($line in [System.IO.File]::ReadLines($dictPath)) {
+            $h = ConvertTo-NtHashHex -Password $line
+            if ($h) { [void]$candidateSet.Add($h) }
+        }
+    }
+    if ($candidateSet.Count -eq 0) { throw 'The dictionary produced no candidates (all entries empty?).' }
+    $candidates = [string[]]::new($candidateSet.Count)
+    $candidateSet.CopyTo($candidates)
 
     # 3. Match.
     $map     = Build-NtHashMap -Account $accounts
