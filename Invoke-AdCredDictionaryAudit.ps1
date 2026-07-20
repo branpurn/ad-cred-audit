@@ -833,13 +833,22 @@ function Get-NtdsAccountHash {
 
 #region Extract — the pluggable seam. Contract: AccountSecret = { SamAccountName, Rid, NtHashHex, Enabled }.
 function Get-AccountSecret {
-    # Lab-gated (Phase B): read the offline ntds.dit and decrypt each NT hash using in-box esent.dll
-    # + CNG/advapi32 crypto (embedded C# via Add-Type). Stubbed until built & validated in a lab.
+    # B6: offline ntds.dit extractor. Emits an AccountSecret record for EVERY account (enabled and
+    # disabled) - Main applies the enabled/canary filter, same as the fixture path. Fail-closed on an
+    # invalid PEK signature happens inside Get-NtdsAccountHash. Heavy lifting lives in the ESE Interop
+    # and Secret Crypto regions (B1-B5) above.
     [CmdletBinding()]
-    param([string]$DatabasePath, [string]$BootKey, [switch]$IncludeDisabledAccounts)
-    throw [System.NotImplementedException]::new(
-        "Get-AccountSecret: ntds.dit extraction is lab-gated (Phase B). " +
-        "Use -FixturePath for offline development, or implement the esent.dll reader in this region.")
+    param([string]$DatabasePath, [string]$BootKey, [string]$SystemHivePath, [switch]$IncludeDisabledAccounts)
+    Get-NtdsAccountHash -DatabasePath $DatabasePath -SystemHivePath $SystemHivePath -BootKey $BootKey `
+        -First 0 -IncludeDisabledAccounts |
+        ForEach-Object {
+            [PSCustomObject]@{
+                SamAccountName = $_.SamAccountName
+                Rid            = [int]$_.Rid
+                NtHashHex      = $_.NtHashHex.ToUpperInvariant()
+                Enabled        = $_.Enabled
+            }
+        }
 }
 
 function Import-AccountSecretFixture {
@@ -1092,7 +1101,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     $accounts = if ($FixturePath) {
         Import-AccountSecretFixture -Path $FixturePath
     } elseif ($DatabasePath) {
-        Get-AccountSecret -DatabasePath $DatabasePath -BootKey $BootKey -IncludeDisabledAccounts:$IncludeDisabledAccounts
+        Get-AccountSecret -DatabasePath $DatabasePath -BootKey $BootKey -SystemHivePath $SystemHivePath -IncludeDisabledAccounts:$IncludeDisabledAccounts
     } else {
         throw 'Provide either -FixturePath (dev) or -DatabasePath (an offline ntds.dit copy).'
     }
