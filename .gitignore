@@ -6,6 +6,19 @@ SECURITY
 *.hive
 *.hiv
 
+# --- ESE transaction/metadata files (can hold raw page images with secrets) ---
+edb*.log
+edb.chk
+*.jfm
+*.jrs
+temp.edb
+
+# --- Dictionaries / wordlists (cleartext candidate passwords, incl. the canary's) ---
+weak*.txt
+*wordlist*
+*dict*.txt
+wordlists/
+
 # --- Extraction output (contains password hashes) ---
 *.hashes
 *.ntds

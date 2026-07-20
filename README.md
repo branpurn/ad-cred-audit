@@ -81,7 +81,9 @@ clear." Two guards make that impossible to miss:
   ```
 
   Pass its name to the audit as `-Canary svc-canary`, and make sure its password is one of the words
-  in your dictionary.
+  in your dictionary. Note: the domain password policy (complexity/length) is still enforced when the
+  password is *set*, even for a disabled account — so pick a dictionary word that satisfies it (e.g.
+  `Summer2024!`), or stage a temporary fine-grained password policy for the canary's OU.
 - **Read-completeness (automatic).** The run verifies it walked every record in the database (the
   engine's own record count vs. rows actually read) and fails closed on a short read — no operator
   input required. Optionally supply `-ExpectedCount` for an additional account-level cross-check.

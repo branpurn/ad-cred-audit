@@ -26,7 +26,8 @@
     .\Invoke-AdCredDictionaryAudit.ps1 -SelfTest
 
 .EXAMPLE
-    .\Invoke-AdCredDictionaryAudit.ps1 -DatabasePath C:\ifm\ntds.dit -BootKey <hex> `
+    # Preferred: derive the boot key from the offline SYSTEM hive (keeps it off the command line):
+    .\Invoke-AdCredDictionaryAudit.ps1 -DatabasePath C:\ifm\ntds.dit -SystemHivePath C:\ifm\SYSTEM `
         -DictionaryFile .\weak.txt -Canary svc-canary-pos -ExpectedCount 4210
 
 .EXAMPLE
@@ -158,7 +159,7 @@ namespace AdCredAudit
         private IntPtr _sesid    = IntPtr.Zero;   // JET_SESID     (pointer-sized)
         private uint   _dbid     = 0;             // JET_DBID      (32-bit)
         private IntPtr _table    = IntPtr.Zero;   // JET_TABLEID   (pointer-sized)
-        private bool _instInited, _sessionOpen, _tableOpen;
+        private bool _sessionOpen, _tableOpen;
         private static int _instanceSeq;
         private static bool _pageSizeSet;   // JET_paramDatabasePageSize is process-global; set it once (M4)
 
@@ -168,7 +169,7 @@ namespace AdCredAudit
         private const uint JET_paramSystemPath          = 0;
         private const uint JET_paramTempPath            = 1;
         private const uint JET_paramLogFilePath         = 2;
-        private const uint JET_paramMaxTemporaryTables  = 60;
+        private const uint JET_paramMaxTemporaryTables  = 10;   // L6: was 60 (that is EnableFileCache); esent.h numbers this 10
         private const uint JET_paramRecovery            = 34;
         private const uint JET_paramDatabasePageSize    = 64;
         private const int  err_Success                  = 0;
@@ -252,30 +253,41 @@ namespace AdCredAudit
 
         public EseReader(string dbPath)
         {
-            string tempDir = System.IO.Path.GetTempPath();
-
-            // Global page size must be set once per process, BEFORE any instance is JetInit'd.
-            // Re-setting it after a prior instance was initialized fails, so guard to set-once (M4).
-            if (!_pageSizeSet)
+            // L3: any Check() below can throw (e.g. JetAttachDatabase on a dirty-shutdown DB, which we
+            // explicitly anticipate). The caller's try/finally around Dispose() does NOT run when a
+            // constructor throws, so release partially-acquired native resources here before rethrowing.
+            try
             {
-                Check(JetSetSystemParameterGlobal(IntPtr.Zero, IntPtr.Zero, JET_paramDatabasePageSize, (IntPtr)NtdsPageSize, null), "set page size");
-                _pageSizeSet = true;
+                string tempDir = System.IO.Path.GetTempPath();
+
+                // Global page size must be set once per process, BEFORE any instance is JetInit'd.
+                // Re-setting it after a prior instance was initialized fails, so guard to set-once (M4).
+                if (!_pageSizeSet)
+                {
+                    Check(JetSetSystemParameterGlobal(IntPtr.Zero, IntPtr.Zero, JET_paramDatabasePageSize, (IntPtr)NtdsPageSize, null), "set page size");
+                    _pageSizeSet = true;
+                }
+
+                string instName = "adcredaudit_" + System.Threading.Interlocked.Increment(ref _instanceSeq);
+                Check(JetCreateInstance(out _instance, instName), "create instance");
+
+                // Per-instance (after create, before init):
+                Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramRecovery, IntPtr.Zero, "Off"), "disable recovery");
+                Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramMaxTemporaryTables, IntPtr.Zero, null), "no temp tables");
+                Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramSystemPath, IntPtr.Zero, tempDir), "system path");
+                Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramTempPath, IntPtr.Zero, tempDir), "temp path");
+                Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramLogFilePath, IntPtr.Zero, tempDir), "log path");
+
+                Check(JetInit(ref _instance), "init");
+                Check(JetBeginSession(_instance, out _sesid, null, null), "begin session"); _sessionOpen = true;
+                Check(JetAttachDatabase(_sesid, dbPath, JET_bitDbReadOnly), "attach database");
+                Check(JetOpenDatabase(_sesid, dbPath, null, out _dbid, JET_bitDbReadOnly), "open database");
             }
-
-            string instName = "adcredaudit_" + System.Threading.Interlocked.Increment(ref _instanceSeq);
-            Check(JetCreateInstance(out _instance, instName), "create instance");
-
-            // Per-instance (after create, before init):
-            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramRecovery, IntPtr.Zero, "Off"), "disable recovery");
-            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramMaxTemporaryTables, IntPtr.Zero, null), "no temp tables");
-            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramSystemPath, IntPtr.Zero, tempDir), "system path");
-            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramTempPath, IntPtr.Zero, tempDir), "temp path");
-            Check(JetSetSystemParameterInst(ref _instance, IntPtr.Zero, JET_paramLogFilePath, IntPtr.Zero, tempDir), "log path");
-
-            Check(JetInit(ref _instance), "init"); _instInited = true;
-            Check(JetBeginSession(_instance, out _sesid, null, null), "begin session"); _sessionOpen = true;
-            Check(JetAttachDatabase(_sesid, dbPath, JET_bitDbReadOnly), "attach database");
-            Check(JetOpenDatabase(_sesid, dbPath, null, out _dbid, JET_bitDbReadOnly), "open database");
+            catch
+            {
+                Dispose();
+                throw;
+            }
         }
 
         private void OpenDatatable()
@@ -341,8 +353,12 @@ namespace AdCredAudit
         {
             uint cb;
             int err = JetRetrieveColumn(_sesid, _table, columnid, null, 0, out cb, 0, IntPtr.Zero);
-            if (err == JET_wrnColumnNull || cb == 0) return null;
+            // L1: check hard errors BEFORE the null/zero short-circuit, so a genuine ESE failure that
+            // leaves cb == 0 is never silently treated as an absent column (which would drop the account
+            // with no exception). Only a real null column (or success with zero length) returns null.
+            if (err == JET_wrnColumnNull) return null;
             if (err != err_Success && err != JET_wrnBufferTruncated) Check(err, "retrieve size");
+            if (cb == 0) return null;
             byte[] buf = new byte[cb];
             err = JetRetrieveColumn(_sesid, _table, columnid, buf, cb, out cb, 0, IntPtr.Zero);
             if (err == JET_wrnColumnNull) return null;
@@ -483,7 +499,9 @@ namespace AdCredAudit
         {
             try { if (_tableOpen)   { JetCloseTable(_sesid, _table); _tableOpen = false; } } catch { }
             try { if (_sessionOpen) { JetEndSession(_sesid, 0);      _sessionOpen = false; } } catch { }
-            try { if (_instInited)  { JetTerm(_instance);            _instInited = false; } } catch { }
+            // L3: terminate the instance whenever one was created, not only when JetInit succeeded,
+            // so a created-but-not-initialized instance on the error path is still released.
+            try { if (_instance != IntPtr.Zero) { JetTerm(_instance); _instance = IntPtr.Zero; } } catch { }
         }
     }
 }
@@ -846,6 +864,9 @@ function Resolve-AuditBootKey {
         return [AdCredAudit.BootKey]::GetBootKey((Resolve-Path -LiteralPath $SystemHivePath).Path)
     }
     if ($BootKey) {
+        # L5: an inline -BootKey persists in PSReadLine history / transcripts / process args and is not
+        # on the default sensitive-word scrub list. Prefer -SystemHivePath, which keeps it off the CLI.
+        Write-Warning 'Passing -BootKey inline exposes it to shell history/transcripts. Prefer -SystemHivePath.'
         $hex = ($BootKey -replace '[^0-9A-Fa-f]', '')
         if ($hex.Length -ne 32) { throw "BootKey must be 32 hex chars (16 bytes); got $($hex.Length)." }
         $b = New-Object byte[] 16
@@ -890,9 +911,19 @@ function Get-NtdsAccountHash {
 
         # Automatic truncation guard: on a full read, verify our iteration walked every datatable row
         # (ESE's own count vs. rows visited). Self-contained; needs no operator-supplied -ExpectedCount.
-        # Skipped when a -First cap is set (deliberate partial read) or the count API returned nothing.
-        if ($First -le 0 -and $ext.TableRowCount -gt 0 -and $ext.RowsWalked -lt $ext.TableRowCount) {
-            throw ('Datatable read incomplete: walked {0} of {1} rows - possible enumeration truncation (fail-closed).' -f $ext.RowsWalked, $ext.TableRowCount)
+        # Skipped when a -First cap is set (deliberate partial read).
+        if ($First -le 0) {
+            if ($ext.TableRowCount -gt 0) {
+                if ($ext.RowsWalked -lt $ext.TableRowCount) {
+                    throw ('Datatable read incomplete: walked {0} of {1} rows - possible enumeration truncation (fail-closed).' -f $ext.RowsWalked, $ext.TableRowCount)
+                }
+            }
+            else {
+                # L2: the record-count API returned nothing, so the automatic completeness check could
+                # not run. Warn loudly rather than degrade silently - the canary remains the backstop,
+                # and -ExpectedCount can be supplied for an explicit account-level reconcile.
+                Write-Warning ('Completeness check unavailable (record count not returned); relying on the canary. Walked {0} rows. Consider -ExpectedCount.' -f $ext.RowsWalked)
+            }
         }
 
         if (-not $ext.PekListBlob) { throw 'No pekList blob found in the datatable.' }
@@ -930,12 +961,12 @@ function Get-NtdsAccountHash {
 
 #region Extract — the pluggable seam. Contract: AccountSecret = { SamAccountName, Rid, NtHashHex, Enabled }.
 function Get-AccountSecret {
-    # B6: offline ntds.dit extractor. Emits an AccountSecret record for every USER account (enabled
-    # and disabled; -IncludeComputerAccounts adds machine/trust). Main applies the enabled/canary
-    # filter, same as the fixture path. Per-account decrypt failures fail-closed inside
-    # Get-NtdsAccountHash. Heavy lifting lives in the ESE Interop and Secret Crypto regions (B1-B5).
+    # B6: offline ntds.dit extractor. Extraction is ALWAYS full (enabled + disabled) so a disabled
+    # canary survives; Main owns the enabled/canary filter (same as the fixture path). There is
+    # deliberately no -IncludeDisabledAccounts here (I1: a dead switch was removed). -IncludeComputerAccounts
+    # adds machine/trust. Per-account decrypt failures fail-closed inside Get-NtdsAccountHash.
     [CmdletBinding()]
-    param([string]$DatabasePath, [string]$BootKey, [string]$SystemHivePath, [switch]$IncludeDisabledAccounts, [switch]$IncludeComputerAccounts)
+    param([string]$DatabasePath, [string]$BootKey, [string]$SystemHivePath, [switch]$IncludeComputerAccounts)
     Get-NtdsAccountHash -DatabasePath $DatabasePath -SystemHivePath $SystemHivePath -BootKey $BootKey `
         -First 0 -IncludeDisabledAccounts -IncludeComputerAccounts:$IncludeComputerAccounts |
         ForEach-Object {
@@ -1214,7 +1245,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         Import-AccountSecretFixture -Path $FixturePath
     } elseif ($DatabasePath) {
         Get-AccountSecret -DatabasePath $DatabasePath -BootKey $BootKey -SystemHivePath $SystemHivePath `
-            -IncludeDisabledAccounts:$IncludeDisabledAccounts -IncludeComputerAccounts:$IncludeComputerAccounts
+            -IncludeComputerAccounts:$IncludeComputerAccounts   # extraction is always full; Main filters disabled below
     } else {
         throw 'Provide either -FixturePath (dev) or -DatabasePath (an offline ntds.dit copy).'
     }

@@ -122,7 +122,7 @@ For each account with a `unicodePwd` blob:
 |---|---|
 | ESE read | `esent.dll` `Jet*` (hand P/Invoke) |
 | Load offline hive | `advapi32!RegLoadAppKey`, `RegOpenKeyEx`, `RegQueryInfoKey` (class name) |
-| RC4 | `advapi32!SystemFunction033` (aka `RtlDecryptData2`) |
+| RC4 | `advapi32!SystemFunction032` (the implementation uses the symmetric `SystemFunction032` == `SystemFunction033`) |
 | DES-by-RID | `advapi32!RtlDecryptNtOwfPwdWithIndex` |
 | MD5 (key derivation) | BCL `System.Security.Cryptography.MD5` |
 | AES-CBC (2016+ DBs) | BCL `System.Security.Cryptography.Aes` |
@@ -171,7 +171,7 @@ shaping ~150 lines. Large, but one file — consistent with the "monster .ps1" c
 | Column/const | `Common/Schema/CommonDirectoryAttributes.cs`, `DirectorySchema.GetAttributeTypeFromColumnName` |
 | BootKey | `DataStore/Cryptography/BootKeyRetriever.cs` |
 | PEK + secret decrypt | `DataStore/Cryptography/DataStoreSecretDecryptor.cs`, `Common/Cryptography/DirectorySecretDecryptor.cs` |
-| RID-DES / RC4 P/Invoke | `Common/Interop/NativeMethods.cs` (`RtlDecryptNtOwfPwdWithIndex`, `SystemFunction033`) |
+| RID-DES / RC4 P/Invoke | `Common/Interop/NativeMethods.cs` (`RtlDecryptNtOwfPwdWithIndex` = `SystemFunction027`; RC4 = `SystemFunction032`) |
 | Account flow | `DataStore/DirectoryAgent.PasswordManagement.cs` (`GetSecretDecryptor`, RID→hash) |
 
 ## 13. Open questions
