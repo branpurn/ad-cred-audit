@@ -152,6 +152,7 @@ namespace AdCredAudit
         private IntPtr _table    = IntPtr.Zero;   // JET_TABLEID   (pointer-sized)
         private bool _instInited, _sessionOpen, _tableOpen;
         private static int _instanceSeq;
+        private static bool _pageSizeSet;   // JET_paramDatabasePageSize is process-global; set it once (M4)
 
         private const uint JET_bitDbReadOnly            = 0x1;
         private const int  JET_MoveFirst                = unchecked((int)0x80000000);
@@ -243,8 +244,13 @@ namespace AdCredAudit
         {
             string tempDir = System.IO.Path.GetTempPath();
 
-            // Global (before instance creation):
-            Check(JetSetSystemParameterGlobal(IntPtr.Zero, IntPtr.Zero, JET_paramDatabasePageSize, (IntPtr)NtdsPageSize, null), "set page size");
+            // Global page size must be set once per process, BEFORE any instance is JetInit'd.
+            // Re-setting it after a prior instance was initialized fails, so guard to set-once (M4).
+            if (!_pageSizeSet)
+            {
+                Check(JetSetSystemParameterGlobal(IntPtr.Zero, IntPtr.Zero, JET_paramDatabasePageSize, (IntPtr)NtdsPageSize, null), "set page size");
+                _pageSizeSet = true;
+            }
 
             string instName = "adcredaudit_" + System.Threading.Interlocked.Increment(ref _instanceSeq);
             Check(JetCreateInstance(out _instance, instName), "create instance");
@@ -668,6 +674,7 @@ namespace AdCredAudit
         // Version(4)|Flags(4)|Salt(16)|Encrypted... ; W2k=RC4(1000 rounds), W2016=AES(strip trailing 16B).
         public static PekList DecryptPekList(byte[] blob, byte[] bootKey)
         {
+            RequireLength(blob, 25, "PEK list blob");   // 24-byte header + at least 1 byte of payload
             int version = BitConverter.ToInt32(blob, 0);
             int flags   = BitConverter.ToInt32(blob, 4);
             byte[] salt = new byte[16]; Array.Copy(blob, 8, salt, 0, 16);
@@ -679,6 +686,7 @@ namespace AdCredAudit
                 if (version == 2) cleartext = DecryptRc4WithSalt(enc, salt, bootKey, 1000);
                 else if (version == 3)
                 {
+                    RequireLength(enc, 17, "encrypted PEK list (AES)");   // trailing 16B block + payload
                     byte[] trimmed = new byte[enc.Length - 16]; Array.Copy(enc, 0, trimmed, 0, trimmed.Length);
                     cleartext = DecryptAesCbc(trimmed, salt, bootKey);
                 }
@@ -692,12 +700,14 @@ namespace AdCredAudit
         // Signature(16)|LastGenerated(8)|CurrentKey(4)|KeyCount(4)|{KeyId(4)|Key(16)}
         private static PekList ParsePekList(byte[] blob, int version, int flags)
         {
+            RequireLength(blob, 32, "decrypted PEK list");   // sig(16)+lastGen(8)+currentKey(4)+count(4)
             PekList pek = new PekList(); pek.Version = version; pek.Flags = flags;
             byte[] sig = new byte[16]; Array.Copy(blob, 0, sig, 0, 16);
             pek.SignatureValid = ByteEquals(sig, PekSignature);
             pek.CurrentKeyIndex = BitConverter.ToInt32(blob, 24);
             int numKeys = BitConverter.ToInt32(blob, 28);
             if (numKeys < 0 || numKeys > 1024) throw new Exception("Implausible PEK key count (" + numKeys + ") - wrong boot key or failed decryption.");
+            RequireLength(blob, 32 + numKeys * 20, "decrypted PEK list keys");   // {keyId(4)+key(16)} x numKeys
             pek.Keys = new byte[numKeys][];
             int off = 32;
             for (int i = 0; i < numKeys; i++)
@@ -716,6 +726,13 @@ namespace AdCredAudit
             return true;
         }
 
+        // M3: guard byte-offset reads so a truncated/corrupt blob yields a clear error, not ArgumentOutOfRange.
+        private static void RequireLength(byte[] blob, int min, string what)
+        {
+            if (blob == null || blob.Length < min)
+                throw new Exception(string.Format("Malformed {0}: need >= {1} bytes, got {2}.", what, min, blob == null ? 0 : blob.Length));
+        }
+
         // ---- B5: per-account NT hash (layer 1 = PEK decrypt, layer 2 = DES-by-RID) ----
 
         [DllImport("advapi32.dll", EntryPoint = "SystemFunction027", SetLastError = true, CallingConvention = CallingConvention.StdCall)]
@@ -724,6 +741,7 @@ namespace AdCredAudit
         // Layer 1: strip the PEK layer. AlgId(2)|Flags(2)|PekId(4)|Salt(16)|[AES only: SecretLen(4)]|EncData
         public static byte[] DecryptSecret(byte[] blob, PekList pek)
         {
+            RequireLength(blob, 25, "secret blob");   // 24-byte header + at least 1 byte of payload
             int algId = BitConverter.ToUInt16(blob, 0);
             int pekId = BitConverter.ToInt32(blob, 4);
             byte[] salt = new byte[16]; Array.Copy(blob, 8, salt, 0, 16);
@@ -737,6 +755,7 @@ namespace AdCredAudit
             }
             if (algId == 0x13) // DatabaseAES
             {
+                RequireLength(blob, 29, "secret blob (AES)");   // 24-byte header + secretLen(4) + payload
                 int secretLen = BitConverter.ToInt32(blob, 24);
                 byte[] enc = new byte[blob.Length - 28]; Array.Copy(blob, 28, enc, 0, enc.Length);
                 byte[] dec = DecryptAesCbc(enc, salt, key);
