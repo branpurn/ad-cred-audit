@@ -1,43 +1,91 @@
-# ad-cred-audit-poc
+# AD Password Dictionary Audit
 
-Offline Active Directory **custom-dictionary** password audit — discovers accounts whose current
-password appears in an operator-supplied dictionary, across the whole domain, **without
-authenticating** (no lockouts).
+Offline, retroactive Active Directory password auditing: find accounts whose **current** password
+appears in a custom dictionary — across the whole domain, **without ever authenticating** (no failed
+logons, no account lockouts).
 
-> **Start here:** [`docs/EXECUTIVE-SUMMARY.md`](docs/EXECUTIVE-SUMMARY.md).
+It runs against an **offline copy** of the directory database (`ntds.dit` plus the `SYSTEM` registry
+hive — for example an `ntdsutil` IFM snapshot), so it never touches a live domain controller.
 
-## One-paragraph architecture
+## Highlights
 
-A single self-contained **`.ps1` script** (`Invoke-AdCredDictionaryAudit.ps1`) works against an
-**offline copy** of `ntds.dit` (replication/IFM snapshot). It reads the database and decrypts each
-account's NT hash using **in-box/OEM components only** (no DSInternals), NT-hashes each dictionary
-word (in-box CNG MD4), matches them against the account hashes, and reports the hits. A fail-closed
-**canary** guards against silent false negatives.
+- **One script, nothing to install.** The whole tool is a single `.ps1` you drop onto a host and
+  run — no modules to import, no build step.
+- **Runs on stock Windows.** It uses only components already shipped with the operating system (CNG,
+  the ESE database engine, the LSA crypto helpers) and the in-box .NET Framework. No third-party
+  libraries.
+- **Read-only and lockout-free.** Everything happens against an offline copy; production accounts are
+  never authenticated against.
+- **Fail-closed by design.** If the tool can't prove its own results are trustworthy, it refuses to
+  report a clean bill of health (see [Assurance](#assurance)).
 
-## Principles (fixed unless explicitly changed)
+## Requirements
 
-- **OEM-first** — Microsoft parts only: in-box Windows APIs + .NET Framework BCL. Microsoft prereqs
-  (.NET Framework, RSAT ActiveDirectory module) installed out-of-band; no third-party code shipped.
-- **Single `.ps1`, not a module** — one file: PowerShell + embedded C# via `Add-Type`. No `.psm1`,
-  nothing to `Import-Module`. Built-in `-SelfTest`; no external test framework.
+- A Windows host with Windows PowerShell 5.1 or PowerShell 7.
+- An offline copy of `ntds.dit` and its matching `SYSTEM` registry hive.
+- *Optional:* the Microsoft `ActiveDirectory` (RSAT) module, to obtain the expected account count for
+  the reconcile check.
 
-## Usage
+## Quick start
 
 ```powershell
-.\Invoke-AdCredDictionaryAudit.ps1 -SelfTest                       # validate the build (run on Windows)
-.\Invoke-AdCredDictionaryAudit.ps1 -FixturePath .\accounts.json ` # offline dev against a JSON fixture
-    -Dictionary password -Canary canary
-.\Invoke-AdCredDictionaryAudit.ps1 -DatabasePath C:\ifm\ntds.dit ` # real run (lab; extractor is Phase B)
-    -BootKey <hex> -DictionaryFile .\weak.txt -Canary svc-canary-pos -ExpectedCount 4210
+# 1. Verify the build on the target host (runs built-in known-answer self-tests):
+.\Invoke-AdCredDictionaryAudit.ps1 -SelfTest
+
+# 2. Audit an offline snapshot against a dictionary:
+.\Invoke-AdCredDictionaryAudit.ps1 `
+    -DatabasePath   'C:\snapshot\Active Directory\ntds.dit' `
+    -SystemHivePath 'C:\snapshot\registry\SYSTEM' `
+    -DictionaryFile .\weak-passwords.txt `
+    -Canary         svc-canary `
+    -ExpectedCount  4210
 ```
+
+The result is a report listing the matched accounts, the number processed, a dictionary fingerprint
+(the wordlist is never written to the report), and the assurance verdict.
+
+## How it works
+
+1. Read the offline `ntds.dit` and derive the boot key from the `SYSTEM` hive.
+2. Decrypt each account's NT hash in memory (password-encryption-key unwrap, then per-account
+   decryption).
+3. NT-hash every dictionary entry and match against the account hashes — `O(accounts + dictionary)`.
+4. Report the accounts whose password is in the dictionary.
+
+User accounts are audited by default; computer and trust accounts (whose passwords are random) are
+skipped unless you pass `-IncludeComputerAccounts`. Disabled accounts are skipped unless you pass
+`-IncludeDisabledAccounts`.
+
+## Assurance
+
+A broken extraction fails *silently* — it decrypts to noise, matches nothing, and reports "all
+clear." Two guards make that impossible to miss:
+
+- **Canary (fail-closed).** Seed a low-privilege account whose password is in the dictionary. If the
+  run doesn't flag it, the run aborts as untrustworthy instead of certifying the results.
+- **Count reconcile.** Supply `-ExpectedCount`; if the run processes fewer accounts than expected
+  (e.g. a truncated read), it fails closed.
+
+Each stage can also be checked in isolation against a snapshot with the built-in probes:
+`-EseProbe`, `-EseDumpAccounts`, `-BootKeyProbe`, `-PekProbe`, and `-HashProbe`.
+
+## Handling
+
+`ntds.dit` contains every account's credentials. Treat the snapshot and any output as highly
+sensitive: work on an isolated host, keep artifacts encrypted at rest and in transit, and securely
+destroy them when finished. **For authorized auditing only.**
 
 ## Status
 
-Pre-lab proof-of-concept. Matcher, hasher, assurance gate, reporter, and `-SelfTest` are built; the
-`ntds.dit` reader/decryptor (the `Get-AccountSecret` region) is stubbed and lab-gated.
+Proof-of-concept. The matching, assurance, reporting, and hashing logic ship with unit tests
+(`-SelfTest`); the offline `ntds.dit` extraction is intended to be validated on a Windows lab domain
+controller using the probes above before use.
 
-## Related folders
+## Documentation
 
-- `../ad-cred-audit` — upstream DSInternals; **reference only** for how the extraction works (not a
-  dependency).
-- `../ad-cred-audit-de-minimis-wip` — trimmed dictionary-match cmdlet; reference for the matcher logic.
+- [`docs/EXECUTIVE-SUMMARY.md`](docs/EXECUTIVE-SUMMARY.md) — goals, approach, and design decisions.
+- [`docs/EXTRACTOR-SPEC.md`](docs/EXTRACTOR-SPEC.md) — internals of the offline `ntds.dit` extraction.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

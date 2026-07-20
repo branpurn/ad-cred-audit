@@ -1,0 +1,21 @@
+# --- Sensitive Active Directory artifacts: never commit ---
+*.dit
+ntds.dit
+SYSTEM
+SECURITY
+*.hive
+*.hiv
+
+# --- Extraction output (contains password hashes) ---
+*.hashes
+*.ntds
+report*.json
+report*.csv
+audit*.json
+audit*.csv
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
