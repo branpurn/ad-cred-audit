@@ -1008,9 +1008,17 @@ function Test-AuditAssurance {
         $failures.Add("Canary '$CanarySamAccountName' was NOT flagged — extraction/match pipeline is untrustworthy (fail-closed).")
     }
 
-    # Count reconcile — fail-closed when an expected count is supplied (guards enumeration truncation).
-    if ($ExpectedCount -ge 0 -and $ProcessedCount -ne $ExpectedCount) {
-        $failures.Add("Count reconcile failed: processed $ProcessedCount of $ExpectedCount expected accounts (fail-closed).")
+    # Count reconcile — the guard is against enumeration TRUNCATION (reading FEWER rows than exist), so
+    # fail closed only when we processed fewer than expected. Processing MORE is a benign scope/
+    # enumeration difference vs. the operator's Get-ADUser count (krbtgt, built-ins, the canary, disabled
+    # accounts, objectClass edge cases) and only warns — exact-match here would spuriously fail healthy runs.
+    if ($ExpectedCount -ge 0) {
+        if ($ProcessedCount -lt $ExpectedCount) {
+            $failures.Add("Count reconcile failed: processed $ProcessedCount, fewer than the $ExpectedCount expected - possible enumeration truncation (fail-closed).")
+        }
+        elseif ($ProcessedCount -gt $ExpectedCount) {
+            $warnings.Add("Processed $ProcessedCount accounts vs. $ExpectedCount expected - scope/enumeration difference; review if unexpected.")
+        }
     }
 
     # Aggregate hit-rate sanity — warn only (false positives are self-evident).
@@ -1091,7 +1099,8 @@ function Invoke-SelfTest {
     $pass = Test-AuditAssurance -Matched $m -CanarySamAccountName 'canary' -ProcessedCount 3 -ExpectedCount 3
     & $assert 'assurance passes when canary present'          ($pass.Passed)
     & $assert 'assurance FAILS when canary absent'            (-not (Test-AuditAssurance -Matched @('alice') -CanarySamAccountName 'canary' -ProcessedCount 3 -ExpectedCount 3).Passed)
-    & $assert 'assurance FAILS on count mismatch'             (-not (Test-AuditAssurance -Matched @('canary') -CanarySamAccountName 'canary' -ProcessedCount 2 -ExpectedCount 3).Passed)
+    & $assert 'assurance FAILS on truncation (processed < expected)' (-not (Test-AuditAssurance -Matched @('canary') -CanarySamAccountName 'canary' -ProcessedCount 2 -ExpectedCount 3).Passed)
+    & $assert 'assurance PASSES (warns) when processed > expected'    ((Test-AuditAssurance -Matched @('canary') -CanarySamAccountName 'canary' -ProcessedCount 5 -ExpectedCount 3).Passed)
     & $assert 'assurance FAILS when no canary specified'      (-not (Test-AuditAssurance -Matched @('alice') -CanarySamAccountName '' -ProcessedCount 3).Passed)
 
     $rep = Format-AuditReport -Matched $m -AccountsProcessed 3 -CandidateHashHex @($Pw) -Canary 'canary' -Assurance $pass
