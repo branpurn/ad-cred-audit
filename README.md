@@ -84,9 +84,10 @@ clear." Two guards make that impossible to miss:
   in your dictionary. Note: the domain password policy (complexity/length) is still enforced when the
   password is *set*, even for a disabled account — so pick a dictionary word that satisfies it (e.g.
   `Summer2024!`), or stage a temporary fine-grained password policy for the canary's OU.
-- **Read-completeness (automatic).** The run verifies it walked every record in the database (the
-  engine's own record count vs. rows actually read) and fails closed on a short read — no operator
-  input required. Optionally supply `-ExpectedCount` for an additional account-level cross-check.
+- **Read-completeness (automatic).** When the database engine reports its record count, the run
+  compares it to the rows actually read and fails closed on a short read — no operator input required.
+  If the engine does not return a count, it warns (rather than failing) and relies on the canary.
+  Optionally supply `-ExpectedCount` for an additional account-level cross-check.
 
 Each stage can also be checked in isolation against a snapshot with the built-in probes:
 `-EseProbe`, `-EseDumpAccounts`, `-BootKeyProbe`, `-PekProbe`, and `-HashProbe`.
