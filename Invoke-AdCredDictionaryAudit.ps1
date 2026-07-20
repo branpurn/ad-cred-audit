@@ -905,8 +905,12 @@ function Get-NtdsAccountHash {
         [switch]$IncludeComputerAccounts
     )
     $bootKeyBytes = Resolve-AuditBootKey -BootKey $BootKey -SystemHivePath $SystemHivePath
+    $progActivity = 'AD credential dictionary audit'
     $reader = [AdCredAudit.EseReader]::new((Resolve-Path -LiteralPath $DatabasePath).Path)
     try {
+        # Phase marker: the datatable scan runs entirely inside one native call, so incremental progress
+        # is not practical here — flag it as the long step instead.
+        Write-Progress -Id 1 -Activity $progActivity -Status 'Reading directory database (this may take a while on a large DB)...'
         $ext = $reader.ReadAllForExtraction($First)   # L7: one datatable pass for PEK + accounts
 
         # Automatic truncation guard: on a full read, verify our iteration walked every datatable row
@@ -932,7 +936,15 @@ function Get-NtdsAccountHash {
             throw 'PEK signature invalid - boot key or decryption is wrong; refusing to emit hashes (fail-closed).'
         }
         $failures = [System.Collections.Generic.List[string]]::new()
+        $accountTotal = $ext.Accounts.Count
+        $accountIndex = 0
         foreach ($r in $ext.Accounts) {
+            $accountIndex++
+            if (($accountIndex % 500) -eq 0 -or $accountIndex -eq $accountTotal) {
+                Write-Progress -Id 1 -Activity $progActivity `
+                    -Status ('Decrypting account hashes ({0:N0} of {1:N0})' -f $accountIndex, $accountTotal) `
+                    -PercentComplete ([int](($accountIndex / [Math]::Max($accountTotal, 1)) * 100))
+            }
             if (-not $r.NtHashBlob) { continue }
             if (-not $IncludeComputerAccounts -and $r.SamAccountType -ne 0x30000000) { continue }
             if (-not $IncludeDisabledAccounts  -and -not $r.Enabled) { continue }
@@ -955,7 +967,10 @@ function Get-NtdsAccountHash {
             throw ('{0} account(s) failed to decrypt - results incomplete, refusing to certify (fail-closed). First few: {1}' -f $failures.Count, $sample)
         }
     }
-    finally { $reader.Dispose() }
+    finally {
+        Write-Progress -Id 1 -Activity $progActivity -Completed
+        $reader.Dispose()
+    }
 }
 #endregion Secret Crypto
 
@@ -1262,15 +1277,29 @@ if ($MyInvocation.InvocationName -ne '.') {
     if (-not $Dictionary -and -not $DictionaryFile) {
         throw 'No dictionary provided (-Dictionary and/or -DictionaryFile).'
     }
+    $mainActivity = 'AD credential dictionary audit'
     $candidateSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if ($Dictionary) {
-        foreach ($w in $Dictionary) { $h = ConvertTo-NtHashHex -Password $w; if ($h) { [void]$candidateSet.Add($h) } }
+        $dt = $Dictionary.Count; $di = 0
+        foreach ($w in $Dictionary) {
+            $di++
+            $h = ConvertTo-NtHashHex -Password $w; if ($h) { [void]$candidateSet.Add($h) }
+            if (($di % 500) -eq 0 -or $di -eq $dt) {
+                Write-Progress -Id 1 -Activity $mainActivity -Status ('Hashing dictionary ({0:N0} of {1:N0})' -f $di, $dt) -PercentComplete ([int](($di / [Math]::Max($dt, 1)) * 100))
+            }
+        }
     }
     if ($DictionaryFile) {
         $dictPath = (Resolve-Path -LiteralPath $DictionaryFile).Path
+        $di = 0
         foreach ($line in [System.IO.File]::ReadLines($dictPath)) {
+            $di++
             $h = ConvertTo-NtHashHex -Password $line
             if ($h) { [void]$candidateSet.Add($h) }
+            # Streamed file: total is unknown without a pre-count, so show a running count (no %).
+            if (($di % 1000) -eq 0) {
+                Write-Progress -Id 1 -Activity $mainActivity -Status ('Hashing dictionary file ({0:N0} entries read)...' -f $di)
+            }
         }
     }
     if ($candidateSet.Count -eq 0) { throw 'The dictionary produced no candidates (all entries empty?).' }
@@ -1278,10 +1307,12 @@ if ($MyInvocation.InvocationName -ne '.') {
     $candidateSet.CopyTo($candidates)
 
     # 3. Match.
+    Write-Progress -Id 1 -Activity $mainActivity -Status 'Matching candidates against account hashes...'
     $map     = Build-NtHashMap -Account $accounts
     $matched = Find-DictionaryMatch -HashMap $map -CandidateHashHex $candidates
 
     # 4. Assurance — fail closed BEFORE any findings are emitted.
+    Write-Progress -Id 1 -Activity $mainActivity -Status 'Verifying assurance (canary + reconcile)...'
     $enabledCount = @($accounts | Where-Object { $_.Enabled }).Count
     $assurance = Test-AuditAssurance -Matched $matched -CanarySamAccountName $Canary `
         -ProcessedCount $accounts.Count -ExpectedCount $ExpectedCount -EnabledCount $enabledCount
@@ -1289,6 +1320,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     foreach ($w in $assurance.Warnings) { Write-Warning $w }
 
     # 5. Report.
+    Write-Progress -Id 1 -Activity $mainActivity -Completed
     Format-AuditReport -Matched $matched -AccountsProcessed $accounts.Count `
         -CandidateHashHex $candidates -Canary $Canary -Assurance $assurance
 }
