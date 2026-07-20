@@ -42,6 +42,7 @@ param(
     [string]$Canary,                       # required for a real run; validated in Main (not [Mandatory]
                                            # so -SelfTest and dot-sourcing don't trigger a prompt)
     [switch]$IncludeDisabledAccounts,
+    [switch]$IncludeComputerAccounts,      # include machine/trust accounts (default: user accounts only)
     [int]$ExpectedCount = -1,
     [string]$FixturePath,                  # dev: load AccountSecret records from JSON instead of extracting
     [switch]$SelfTest,
@@ -798,13 +799,21 @@ function Get-NtdsPekList {
 
 function Get-NtdsAccountHash {
     # B5: decrypt each account's NT hash (PEK layer + DES-by-RID). One ESE open for PEK + accounts.
+    #
+    # H2: users-only by default (SAM_NORMAL_USER_ACCOUNT = 0x30000000). Computer passwords are random
+    #     and never match a dictionary, and including them makes -ExpectedCount reconcile unintuitive;
+    #     -IncludeComputerAccounts adds machine/trust accounts back.
+    # H1: a per-account decryption failure is collected (never silently skipped -> that would be a
+    #     false negative) and triggers a FAIL-CLOSED abort at the end, with a count + sample, instead
+    #     of the whole run dying opaquely on the first oddball account.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$DatabasePath,
         [string]$SystemHivePath,
         [string]$BootKey,
         [int]$First = 0,                       # 0 = all accounts
-        [switch]$IncludeDisabledAccounts
+        [switch]$IncludeDisabledAccounts,
+        [switch]$IncludeComputerAccounts
     )
     $bootKeyBytes = Resolve-AuditBootKey -BootKey $BootKey -SystemHivePath $SystemHivePath
     $reader = [AdCredAudit.EseReader]::new((Resolve-Path -LiteralPath $DatabasePath).Path)
@@ -815,16 +824,28 @@ function Get-NtdsAccountHash {
         if (-not $pek.SignatureValid) {
             throw 'PEK signature invalid - boot key or decryption is wrong; refusing to emit hashes (fail-closed).'
         }
+        $failures = [System.Collections.Generic.List[string]]::new()
         foreach ($r in $reader.DumpAccountRows($First)) {
             if (-not $r.NtHashBlob) { continue }
-            if (-not $IncludeDisabledAccounts -and -not $r.Enabled) { continue }
-            $nt = [AdCredAudit.Secret]::DecryptNtHash($r.NtHashBlob, [int]$r.Rid, $pek)
+            if (-not $IncludeComputerAccounts -and $r.SamAccountType -ne 0x30000000) { continue }
+            if (-not $IncludeDisabledAccounts  -and -not $r.Enabled) { continue }
+            try {
+                $nt = [AdCredAudit.Secret]::DecryptNtHash($r.NtHashBlob, [int]$r.Rid, $pek)
+            }
+            catch {
+                $failures.Add(('{0} (RID {1}): {2}' -f $r.SamAccountName, $r.Rid, $_.Exception.Message))
+                continue
+            }
             [PSCustomObject]@{
                 SamAccountName = $r.SamAccountName
                 Rid            = $r.Rid
                 Enabled        = $r.Enabled
                 NtHashHex      = (-join ($nt | ForEach-Object { $_.ToString('X2') }))
             }
+        }
+        if ($failures.Count -gt 0) {
+            $sample = ($failures | Select-Object -First 5) -join ' | '
+            throw ('{0} account(s) failed to decrypt - results incomplete, refusing to certify (fail-closed). First few: {1}' -f $failures.Count, $sample)
         }
     }
     finally { $reader.Dispose() }
@@ -833,14 +854,14 @@ function Get-NtdsAccountHash {
 
 #region Extract — the pluggable seam. Contract: AccountSecret = { SamAccountName, Rid, NtHashHex, Enabled }.
 function Get-AccountSecret {
-    # B6: offline ntds.dit extractor. Emits an AccountSecret record for EVERY account (enabled and
-    # disabled) - Main applies the enabled/canary filter, same as the fixture path. Fail-closed on an
-    # invalid PEK signature happens inside Get-NtdsAccountHash. Heavy lifting lives in the ESE Interop
-    # and Secret Crypto regions (B1-B5) above.
+    # B6: offline ntds.dit extractor. Emits an AccountSecret record for every USER account (enabled
+    # and disabled; -IncludeComputerAccounts adds machine/trust). Main applies the enabled/canary
+    # filter, same as the fixture path. Per-account decrypt failures fail-closed inside
+    # Get-NtdsAccountHash. Heavy lifting lives in the ESE Interop and Secret Crypto regions (B1-B5).
     [CmdletBinding()]
-    param([string]$DatabasePath, [string]$BootKey, [string]$SystemHivePath, [switch]$IncludeDisabledAccounts)
+    param([string]$DatabasePath, [string]$BootKey, [string]$SystemHivePath, [switch]$IncludeDisabledAccounts, [switch]$IncludeComputerAccounts)
     Get-NtdsAccountHash -DatabasePath $DatabasePath -SystemHivePath $SystemHivePath -BootKey $BootKey `
-        -First 0 -IncludeDisabledAccounts |
+        -First 0 -IncludeDisabledAccounts -IncludeComputerAccounts:$IncludeComputerAccounts |
         ForEach-Object {
             [PSCustomObject]@{
                 SamAccountName = $_.SamAccountName
@@ -1091,7 +1112,8 @@ if ($MyInvocation.InvocationName -ne '.') {
     if ($HashProbe) {
         if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-HashProbe requires -DatabasePath (and -SystemHivePath or -BootKey).' }
         Get-NtdsAccountHash -DatabasePath $DatabasePath -SystemHivePath $SystemHivePath -BootKey $BootKey `
-            -First $First -IncludeDisabledAccounts:$IncludeDisabledAccounts | Format-Table -AutoSize
+            -First $First -IncludeDisabledAccounts:$IncludeDisabledAccounts `
+            -IncludeComputerAccounts:$IncludeComputerAccounts | Format-Table -AutoSize
         return
     }
 
@@ -1101,7 +1123,8 @@ if ($MyInvocation.InvocationName -ne '.') {
     $accounts = if ($FixturePath) {
         Import-AccountSecretFixture -Path $FixturePath
     } elseif ($DatabasePath) {
-        Get-AccountSecret -DatabasePath $DatabasePath -BootKey $BootKey -SystemHivePath $SystemHivePath -IncludeDisabledAccounts:$IncludeDisabledAccounts
+        Get-AccountSecret -DatabasePath $DatabasePath -BootKey $BootKey -SystemHivePath $SystemHivePath `
+            -IncludeDisabledAccounts:$IncludeDisabledAccounts -IncludeComputerAccounts:$IncludeComputerAccounts
     } else {
         throw 'Provide either -FixturePath (dev) or -DatabasePath (an offline ntds.dit copy).'
     }
