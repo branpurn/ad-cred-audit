@@ -29,10 +29,14 @@ hive — for example an `ntdsutil` IFM snapshot), so it never touches a live dom
 ## Quick start
 
 ```powershell
-# 1. Verify the build on the target host (runs built-in known-answer self-tests):
+# 1. On a domain controller (elevated), take a clean offline snapshot of the directory.
+#    Writes ntds.dit + the SYSTEM/SECURITY hives under C:\snapshot; the live database is untouched:
+ntdsutil "activate instance ntds" "ifm" "create full C:\snapshot" quit quit
+
+# 2. Verify the build on the analysis host (runs built-in known-answer self-tests):
 .\Invoke-AdCredDictionaryAudit.ps1 -SelfTest
 
-# 2. Audit an offline snapshot against a dictionary:
+# 3. Audit the snapshot against a dictionary:
 .\Invoke-AdCredDictionaryAudit.ps1 `
     -DatabasePath   'C:\snapshot\Active Directory\ntds.dit' `
     -SystemHivePath 'C:\snapshot\registry\SYSTEM' `
