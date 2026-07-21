@@ -23,6 +23,9 @@ hive — for example an `ntdsutil` IFM snapshot), so it never touches a live dom
 
 - A Windows host with Windows PowerShell 5.1 or PowerShell 7.
 - An offline copy of `ntds.dit` and its matching `SYSTEM` registry hive.
+- The analysis host should **not** be FIPS-enforced. Older (RC4-era) databases use MD5 during
+  decryption, and the managed MD5 provider throws under FIPS policy; the tool reports a clear error if
+  it hits this. Fully-AES (2016+) databases are unaffected.
 - *Optional:* the Microsoft `ActiveDirectory` (RSAT) module, if you want to pass `-ExpectedCount` for
   the additional account-level cross-check (truncation protection is automatic and needs neither).
 

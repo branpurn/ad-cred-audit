@@ -713,12 +713,22 @@ namespace AdCredAudit
         // MD5(key || salt x rounds) — mirrors DSInternals ComputeMD5.
         public static byte[] ComputeMd5(byte[] key, byte[] salt, int rounds)
         {
-            using (MD5 md5 = MD5.Create())
+            // #7: on a FIPS-enforced host the managed MD5 provider can throw. Surface a clear,
+            // actionable error instead of a cryptic crash. (MD5 is only reached on the RC4-era
+            // decryption path; fully-AES databases never call it.)
+            try
             {
-                md5.TransformBlock(key, 0, key.Length, null, 0);
-                for (int i = 1; i < rounds; i++) md5.TransformBlock(salt, 0, salt.Length, null, 0);
-                md5.TransformFinalBlock(salt, 0, salt.Length);
-                return md5.Hash;
+                using (MD5 md5 = MD5.Create())
+                {
+                    md5.TransformBlock(key, 0, key.Length, null, 0);
+                    for (int i = 1; i < rounds; i++) md5.TransformBlock(salt, 0, salt.Length, null, 0);
+                    md5.TransformFinalBlock(salt, 0, salt.Length);
+                    return md5.Hash;
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("MD5 is unavailable - this analysis host may be FIPS-enforced. The RC4-era ntds.dit decryption path requires MD5; run the audit on a non-FIPS host. Underlying error: " + ex.Message, ex);
             }
         }
 
@@ -1247,8 +1257,11 @@ if ($MyInvocation.InvocationName -ne '.') {
         if ([string]::IsNullOrWhiteSpace($DatabasePath)) { throw '-HashProbe requires -DatabasePath (and -SystemHivePath or -BootKey).' }
         # L8: default to ALL accounts so the canary is included; honor -First only if explicitly given.
         $hashFirst = if ($PSBoundParameters.ContainsKey('First')) { $First } else { 0 }
+        # #9: include disabled accounts by default so a DISABLED canary (the recommended kind) is visible
+        # during B5 validation; the operator can still override with -IncludeDisabledAccounts:$false.
+        $hashInclDisabled = if ($PSBoundParameters.ContainsKey('IncludeDisabledAccounts')) { [bool]$IncludeDisabledAccounts } else { $true }
         Get-NtdsAccountHash -DatabasePath $DatabasePath -SystemHivePath $SystemHivePath -BootKey $BootKey `
-            -First $hashFirst -IncludeDisabledAccounts:$IncludeDisabledAccounts `
+            -First $hashFirst -IncludeDisabledAccounts:$hashInclDisabled `
             -IncludeComputerAccounts:$IncludeComputerAccounts | Format-Table -AutoSize
         return
     }
