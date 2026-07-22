@@ -7,6 +7,10 @@ logons, no account lockouts).
 It runs against an **offline copy** of the directory database (`ntds.dit` plus the `SYSTEM` registry
 hive — for example an `ntdsutil` IFM snapshot), so it never touches a live domain controller.
 
+Where it fits: environments with large numbers of default passwords — and places where the execution
+footprint of one self-contained PowerShell script tends to clear managerial review more readily than
+multi-package installs.
+
 ## Highlights
 
 - **One script, nothing to install.** The whole tool is a single `.ps1` you drop onto a host and
